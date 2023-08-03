@@ -21,11 +21,10 @@ $ ./run
     #include <sys/mman.h>
 #endif
 
-#include <fstream>
+#include <complex>
 #include <iostream>
 #include <vector>
 #include <sys/stat.h>
-#include <array>
 
 class MMap {
 public:
@@ -39,7 +38,7 @@ public:
         size = fileInfo.st_size;
         data = mmap(NULL, fileInfo.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
         cur = static_cast<char*>(data);
-        close(fd); // we can close the file after mapping
+        close(fd); // we can close the file once mapped
         if (data == MAP_FAILED) {
             printf("mmap failed!\n");
             exit(1);
@@ -54,7 +53,7 @@ public:
     }
 
     template<typename T>
-    MMap& operator>>(T& rhs) {
+    MMap& operator>> (T& rhs) {
         rhs = *this->get<T>();
         return *this;
     }
@@ -267,22 +266,16 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         matmul(s->v, s->xb, w->wv + l*dim*dim, dim, dim);
 
         // apply RoPE rotation to the q and k vectors for each head
+        int freq_cis_size = head_size / 2;
         for (int h = 0; h < p->n_heads; h++) {
-            // get the q and k vectors for this head
-            float* q = s->q + h * head_size;
-            float* k = s->k + h * head_size;
+            // get the q and k complex vectors for this head
+            complex<float>* q_c = (complex<float>*)(s->q + h * head_size);
+            complex<float>* k_c = (complex<float>*)(s->k + h * head_size);
             // rotate q and k by the freq_cis_real and freq_cis_imag
-            for (int i = 0; i < head_size; i+=2) {
-                float q0 = q[i];
-                float q1 = q[i+1];
-                float k0 = k[i];
-                float k1 = k[i+1];
-                float fcr = freq_cis_real_row[i/2];
-                float fci = freq_cis_imag_row[i/2];
-                q[i]   = q0 * fcr - q1 * fci;
-                q[i+1] = q0 * fci + q1 * fcr;
-                k[i]   = k0 * fcr - k1 * fci;
-                k[i+1] = k0 * fci + k1 * fcr;
+            for (int i = 0; i < freq_cis_size; i++) {
+                complex<float> f(freq_cis_real_row[i], freq_cis_imag_row[i]);
+                q_c[i] *= f;
+                k_c[i] *= f;
             }
         }
 
@@ -374,10 +367,10 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 // ----------------------------------------------------------------------------
 // byte pair encoding (BPE) tokenizer, encodes strings into tokens so we can prompt
 
-int str_lookup(const string& str, const vector<string>& v) {
+int str_lookup(const string& str, const vector<string>& vocab) {
     // find the first perfect match for str in vocab, return its index or -1 if not found
-    for (int i = 0; i < v.size(); i++) {
-        if (str == v[i])
+    for (int i = 0; i < vocab.size(); i++) {
+        if (str == vocab[i])
             return i;
     }
     return -1;
@@ -483,7 +476,7 @@ void init(MMap& m, Config* config, TransformerWeights* weights, vector<string>* 
 
     // Read in the tokenizer.bin file
     MMap t("tokenizer.bin");
-    t.get<int32_t>(); // ignore max_token_length
+    t >> x; // ignore max_token_length
 
     for (size_t i = 0; i < config->vocab_size; i++) {
         t >> dummy >> len; // ignore scores
@@ -584,8 +577,10 @@ int main(int argc, char* argv[]) {
         // advance forward
         token = next;
         pos++;
+
         // init our timer here because the first iteration is slow due to memmap
-        if (start == 0) { start = time_in_ms(); }
+        if (start == 0)
+            start = time_in_ms();
     }
 
     // report achieved tok/s
