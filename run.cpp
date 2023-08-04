@@ -25,6 +25,7 @@ $ ./run
 #include <iostream>
 #include <vector>
 #include <sys/stat.h>
+#include <memory>
 
 class MMap {
 public:
@@ -81,7 +82,7 @@ typedef struct {
 
 typedef struct {
     // token embedding table
-    float* token_embedding_table;    // (vocab_size, dim)
+    float* token_embedding_table; // (vocab_size, dim)
     // weights for rmsnorms
     float* rms_att_weight; // (layer, dim) rmsnorm weights
     float* rms_ffn_weight; // (layer, dim)
@@ -104,26 +105,29 @@ typedef struct {
 } TransformerWeights;
 
 typedef struct {
-    // current wave of activations
-    float *x; // activation at current time stamp (dim,)
-    float *xb; // same, but inside a residual branch (dim,)
+    // Current wave of activations
+    float *x;   // activation at current time stamp (dim,)
+    float *xb;  // same, but inside a residual branch (dim,)
     float *xb2; // an additional buffer just for convenience (dim,)
-    float *hb; // buffer for hidden dimension in the ffn (hidden_dim,)
+    float *hb;  // buffer for hidden dimension in the ffn (hidden_dim,)
     float *hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
-    float *q; // query (dim,)
-    float *k; // key (dim,)
-    float *v; // value (dim,)
+    float *q;   // query (dim,)
+    float *k;   // key (dim,)
+    float *v;   // value (dim,)
     float *att; // buffer for scores/attention values (n_heads, seq_len)
     float *logits; // output logits
-    // kv cache
+    // Key and Value cache
     float* key_cache;   // (layer, seq_len, dim)
     float* value_cache; // (layer, seq_len, dim)
+    // Helper complex vector for RoPE
     complex<float>* freq_cis; // (seq_len, head_size / 2)
 } RunState;
 
-void malloc_run_state(RunState* s, Config* p) {
-    // we calloc instead of malloc to keep valgrind happy
-    int head_size = p->dim / p->n_heads;
+void init_run_state(RunState* s, Config* p, TransformerWeights* w) {
+
+    // We calloc instead of malloc to keep valgrind happy
+    size_t head_size = p->dim / p->n_heads;
+
     s->x = (float*)calloc(p->dim, sizeof(float));
     s->xb = (float*)calloc(p->dim, sizeof(float));
     s->xb2 = (float*)calloc(p->dim, sizeof(float));
@@ -137,13 +141,18 @@ void malloc_run_state(RunState* s, Config* p) {
     s->key_cache = (float*)calloc(p->n_layers * p->seq_len * p->dim, sizeof(float));
     s->value_cache = (float*)calloc(p->n_layers * p->seq_len * p->dim, sizeof(float));
     s->freq_cis = (complex<float>*)calloc(p->seq_len * head_size / 2, sizeof(complex<float>));
-    // ensure all mallocs went fine
-    if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
-     || !s->k || !s->v || !s->att || !s->logits || !s->key_cache
-     || !s->value_cache) {
-        printf("malloc failed!\n");
+
+    // Ensure all memory allocations went fine
+    if (   !s->x || !s->xb || !s->xb2 || !s->hb     || !s->hb2 || !s->q
+        || !s->k || !s->v  || !s->att || !s->logits || !s->key_cache
+        || !s->value_cache || !s->freq_cis) {
+        printf("Cannot allocate run state!\n");
         exit(1);
     }
+
+    // Copy loaded RoPE vectors into a single complex vector
+    for (size_t i = 0; i < p->seq_len * head_size / 2; i++)
+        s->freq_cis[i] = complex<float>(w->freq_cis_real[i], w->freq_cis_imag[i]);
 }
 
 void free_run_state(RunState* s) {
@@ -370,7 +379,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 // byte pair encoding (BPE) tokenizer, encodes strings into tokens so we can prompt
 
 int str_lookup(const string& str, const vector<string>& vocab) {
-    // find the first perfect match for str in vocab, return its index or -1 if not found
+    // Find first match for str in vocab, return its index or -1 if not found
     for (int i = 0; i < vocab.size(); i++) {
         if (str == vocab[i])
             return i;
@@ -472,8 +481,15 @@ void init(MMap& m, Config* config, TransformerWeights* weights, vector<string>* 
     float dummy;
 
     // Read in the config header, values are int32_t on disk
-    size_t* ptr = reinterpret_cast<size_t*>(config);
-    for (size_t i = 0; i < sizeof(Config)/sizeof(size_t); i++) {
+    // but we want them to be size_t.
+    static const size_t Num = sizeof(Config) / sizeof(size_t);
+
+    // All Config fields are size_t, so define a union with
+    // an array to iterate over them.
+    typedef union { struct Config; size_t vec[Num]; } U;
+    size_t* ptr = reinterpret_cast<U*>(config)->vec;
+
+    for (size_t i = 0; i < Num; i++) {
         m >> x;
         *ptr++ = static_cast<size_t>(x);
     }
@@ -546,12 +562,7 @@ int main(int argc, char* argv[]) {
 
     // create and init the application RunState
     RunState state;
-    malloc_run_state(&state, &config);
-
-    int head_size = config.dim / config.n_heads;
-    for (int i = 0; i < config.seq_len * head_size / 2; i++) {
-        state.freq_cis[i] = complex<float>(weights.freq_cis_real[i], weights.freq_cis_imag[i]);
-    }
+    init_run_state(&state, &config, &weights);
 
     // start the main loop
     long start = 0;  // used to time our code, only initialized after first iteration
@@ -575,7 +586,7 @@ int main(int argc, char* argv[]) {
                 next = argmax(state.logits, config.vocab_size);
             } else {
                 // apply the temperature to the logits
-                for (int q=0; q<config.vocab_size; q++) { state.logits[q] /= temperature; }
+                for (int q = 0; q <config.vocab_size; q++) { state.logits[q] /= temperature; }
                 // apply softmax to the logits to get the probabilities for next token
                 softmax(state.logits, config.vocab_size);
                 // we sample from this distribution to get the next token
