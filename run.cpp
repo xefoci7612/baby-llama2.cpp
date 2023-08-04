@@ -378,16 +378,25 @@ int str_lookup(const string& str, const vector<string>& vocab) {
     return -1;
 }
 
+// Extract next UTF-8 character updating the pointer
+string next_utf8(char*& text) {
+
+    // In UTF-8 multi-byte any byte but the first has format 10xxxxxx
+    char* start = text++;
+    while ((*text & 0xc0) == 0x80) { text++; }
+    return string(start, text - start);
+}
+
 void bpe_encode(char* text, const vector<string>& vocab, vector<int>& tokens) {
 
-    // first encode every individual byte in the input string
-    for (char *c = text; *c != '\0'; c++) {
-        int id = str_lookup(string(c, 1), vocab);
-        if (id == -1) { printf("not good\n"); exit(1); }
+    // First encode every individual UTF-8 character in the input string
+    while (*text) {
+        int id = str_lookup(next_utf8(text), vocab);
+        if (id == -1) { printf("UTF-8 character not in vocab\n"); exit(1); }
         tokens.push_back(id);
     }
 
-    // merge consecutive tokens until there are no more new merges
+    // Merge consecutive tokens until there are no more new merges
     int merge_found = 1;
     while (merge_found) {
         merge_found = 0;
