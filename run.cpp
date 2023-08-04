@@ -97,8 +97,8 @@ typedef struct {
     // final rmsnorm
     float* rms_final_weight; // (dim,)
     // freq_cis for RoPE relatively positional embeddings
-    float* freq_cis_real; // (seq_len, dim/2)
-    float* freq_cis_imag; // (seq_len, dim/2)
+    float* freq_cis_real; // (seq_len, head_size / 2)
+    float* freq_cis_imag; // (seq_len, head_size / 2)
     // (optional) classifier weights for the logits, on the last layer
     float* wcls;
 } TransformerWeights;
@@ -118,10 +118,12 @@ typedef struct {
     // kv cache
     float* key_cache;   // (layer, seq_len, dim)
     float* value_cache; // (layer, seq_len, dim)
+    complex<float>* freq_cis; // (seq_len, head_size / 2)
 } RunState;
 
 void malloc_run_state(RunState* s, Config* p) {
     // we calloc instead of malloc to keep valgrind happy
+    int head_size = p->dim / p->n_heads;
     s->x = (float*)calloc(p->dim, sizeof(float));
     s->xb = (float*)calloc(p->dim, sizeof(float));
     s->xb2 = (float*)calloc(p->dim, sizeof(float));
@@ -134,6 +136,7 @@ void malloc_run_state(RunState* s, Config* p) {
     s->logits = (float*)calloc(p->vocab_size, sizeof(float));
     s->key_cache = (float*)calloc(p->n_layers * p->seq_len * p->dim, sizeof(float));
     s->value_cache = (float*)calloc(p->n_layers * p->seq_len * p->dim, sizeof(float));
+    s->freq_cis = (complex<float>*)calloc(p->seq_len * head_size / 2, sizeof(complex<float>));
     // ensure all mallocs went fine
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
      || !s->k || !s->v || !s->att || !s->logits || !s->key_cache
@@ -156,6 +159,7 @@ void free_run_state(RunState* s) {
     free(s->logits);
     free(s->key_cache);
     free(s->value_cache);
+    free(s->freq_cis);
 }
 
 // ----------------------------------------------------------------------------
@@ -250,12 +254,11 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     float* content_row = &(w->token_embedding_table[token * dim]);
     memcpy(x, content_row, dim*sizeof(*x));
 
-    // pluck out the "pos" row of freq_cis_real and freq_cis_imag
-    float* freq_cis_real_row = w->freq_cis_real + pos * head_size / 2;
-    float* freq_cis_imag_row = w->freq_cis_imag + pos * head_size / 2;
+    // pluck out the "pos" row of freq_cis
+    complex<float>* freq_cis_row = s->freq_cis + pos * head_size / 2;
 
     // forward all the layers
-    for(int l = 0; l < p->n_layers; l++) {
+    for (int l = 0; l < p->n_layers; l++) {
 
         // attention rmsnorm
         rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
@@ -266,16 +269,16 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         matmul(s->v, s->xb, w->wv + l*dim*dim, dim, dim);
 
         // apply RoPE rotation to the q and k vectors for each head
-        int freq_cis_size = head_size / 2;
-        for (int h = 0; h < p->n_heads; h++) {
+        int h;
+        #pragma omp parallel for private(h)
+        for (h = 0; h < p->n_heads; h++) {
             // get the q and k complex vectors for this head
             complex<float>* q_c = (complex<float>*)(s->q + h * head_size);
             complex<float>* k_c = (complex<float>*)(s->k + h * head_size);
             // rotate q and k by the freq_cis_real and freq_cis_imag
-            for (int i = 0; i < freq_cis_size; i++) {
-                complex<float> f(freq_cis_real_row[i], freq_cis_imag_row[i]);
-                q_c[i] *= f;
-                k_c[i] *= f;
+            for (int i = 0; i < head_size / 2; i++) {
+                q_c[i] *= freq_cis_row[i];
+                k_c[i] *= freq_cis_row[i];
             }
         }
 
@@ -287,7 +290,6 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         memcpy(value_cache_row, s->v, dim*sizeof(*value_cache_row));
 
         // multihead attention. iterate over all heads
-        int h;
         #pragma omp parallel for private(h)
         for (h = 0; h < p->n_heads; h++) {
             // get the query vector for this head
@@ -536,6 +538,11 @@ int main(int argc, char* argv[]) {
     // create and init the application RunState
     RunState state;
     malloc_run_state(&state, &config);
+
+    int head_size = config.dim / config.n_heads;
+    for (int i = 0; i < config.seq_len * head_size / 2; i++) {
+        state.freq_cis[i] = complex<float>(weights.freq_cis_real[i], weights.freq_cis_imag[i]);
+    }
 
     // start the main loop
     long start = 0;  // used to time our code, only initialized after first iteration
