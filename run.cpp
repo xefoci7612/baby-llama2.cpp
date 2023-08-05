@@ -25,7 +25,6 @@ $ ./run
 #include <iostream>
 #include <vector>
 #include <sys/stat.h>
-#include <memory>
 
 using namespace std;
 
@@ -43,35 +42,36 @@ public:
         }
         size = fileInfo.st_size;
         data = mmap(NULL, fileInfo.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        cur = static_cast<char*>(data);
-        close(fd); // we can close the file once mapped
         if (data == MAP_FAILED) {
             printf("mmap failed!\n");
             exit(1);
         }
+        cur = static_cast<char*>(data);
+        close(fd); // we can close the file once mapped
     }
     ~MMap() { munmap(data, size); }
 
     template<typename T>
-    T* get(size_t len = 1) {
+    T* get_ptr(size_t len) {
+        T* ptr = reinterpret_cast<T*>(cur);
         cur += len * sizeof(T);
-        return reinterpret_cast<T*>(cur - len * sizeof(T));
+        return ptr;
     }
 
     template<typename T>
     MMap& operator>> (T& rhs) {
-        rhs = *this->get<T>();
+        rhs = *this->get_ptr<T>(1);
         return *this;
     }
 
 private:
     size_t size;
     void* data;
-    char* cur;
+    char* cur; // pointer arithmetic on void* is not standard
 };
 
 // ----------------------------------------------------------------------------
-// Transformer and RunState structs, and related memory management
+// Transformer and RunState structs, and related initializations
 
 struct Config {
     size_t dim; // transformer dimension
@@ -109,16 +109,16 @@ struct TransformerWeights {
 
 struct RunState {
     // Current wave of activations
-    float *x;   // activation at current time stamp (dim,)
-    float *xb;  // same, but inside a residual branch (dim,)
-    float *xb2; // an additional buffer just for convenience (dim,)
-    float *hb;  // buffer for hidden dimension in the ffn (hidden_dim,)
-    float *hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
-    float *q;   // query (dim,)
-    float *k;   // key (dim,)
-    float *v;   // value (dim,)
-    float *att; // buffer for scores/attention values (n_heads, seq_len)
-    float *logits; // output logits
+    float* x;   // activation at current time stamp (dim,)
+    float* xb;  // same, but inside a residual branch (dim,)
+    float* xb2; // an additional buffer just for convenience (dim,)
+    float* hb;  // buffer for hidden dimension in the ffn (hidden_dim,)
+    float* hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
+    float* q;   // query (dim,)
+    float* k;   // key (dim,)
+    float* v;   // value (dim,)
+    float* att; // buffer for scores/attention values (n_heads, seq_len)
+    float* logits; // output logits
     // Key and Value cache
     float* key_cache;   // (layer, seq_len, dim)
     float* value_cache; // (layer, seq_len, dim)
@@ -140,53 +140,54 @@ struct RunState {
         return static_cast<T*>(mem_vec[len++]);
     }
 
-    RunState(Config*, TransformerWeights*);
+    RunState(const Config&, const TransformerWeights&);
    ~RunState() { for (int i = 0; i < len; i++) free(mem_vec[i]); }
 };
 
-RunState::RunState(Config* p, TransformerWeights* w) {
+RunState::RunState(const Config& p, const TransformerWeights& w) {
 
-    size_t head_size = p->dim / p->n_heads;
+    size_t head_size = p.dim / p.n_heads;
 
-    x   = alloc<float>(p->dim);
-    xb  = alloc<float>(p->dim);
-    xb2 = alloc<float>(p->dim);
-    hb  = alloc<float>(p->hidden_dim);
-    hb2 = alloc<float>(p->hidden_dim);
-    q   = alloc<float>(p->dim);
-    k   = alloc<float>(p->dim);
-    v   = alloc<float>(p->dim);
-    att = alloc<float>(p->n_heads * p->seq_len);
-    logits      = alloc<float>(p->vocab_size);
-    key_cache   = alloc<float>(p->n_layers * p->seq_len * p->dim);
-    value_cache = alloc<float>(p->n_layers * p->seq_len * p->dim);
-    freq_cis    = alloc<complex<float>>(p->seq_len * head_size / 2);
+    x   = alloc<float>(p.dim);
+    xb  = alloc<float>(p.dim);
+    xb2 = alloc<float>(p.dim);
+    hb  = alloc<float>(p.hidden_dim);
+    hb2 = alloc<float>(p.hidden_dim);
+    q   = alloc<float>(p.dim);
+    k   = alloc<float>(p.dim);
+    v   = alloc<float>(p.dim);
+    att = alloc<float>(p.n_heads * p.seq_len);
+    logits      = alloc<float>(p.vocab_size);
+    key_cache   = alloc<float>(p.n_layers * p.seq_len * p.dim);
+    value_cache = alloc<float>(p.n_layers * p.seq_len * p.dim);
 
-    // Copy loaded RoPE vectors into a single complex vector
-    for (size_t i = 0; i < p->seq_len * head_size / 2; i++)
-        freq_cis[i] = complex<float>(w->freq_cis_real[i], w->freq_cis_imag[i]);
+    freq_cis    = alloc<complex<float>>(p.seq_len * head_size / 2);
+
+    // Copy the 2 loaded RoPE vectors into a single complex vector
+    for (size_t i = 0; i < p.seq_len * head_size / 2; i++)
+        freq_cis[i] = complex<float>(w.freq_cis_real[i], w.freq_cis_imag[i]);
 }
 
-// ----------------------------------------------------------------------------
-// initialization: read from checkpoint
+void init_weights(MMap& m, TransformerWeights* w, const Config& p, bool shared_weights) {
 
-void init_weights(MMap& m, Config* p, TransformerWeights* w, bool shared_weights) {
+    size_t head_size = p.dim / p.n_heads;
 
-    int head_size = p->dim / p->n_heads;
-    w->token_embedding_table = m.get<float>(p->vocab_size * p->dim);
-    w->rms_att_weight        = m.get<float>(p->n_layers * p->dim);
-    w->wq                    = m.get<float>(p->n_layers * p->dim * p->dim);
-    w->wk                    = m.get<float>(p->n_layers * p->dim * p->dim);
-    w->wv                    = m.get<float>(p->n_layers * p->dim * p->dim);
-    w->wo                    = m.get<float>(p->n_layers * p->dim * p->dim);
-    w->rms_ffn_weight        = m.get<float>(p->n_layers * p->dim);
-    w->w1                    = m.get<float>(p->n_layers * p->dim * p->hidden_dim);
-    w->w2                    = m.get<float>(p->n_layers * p->dim * p->hidden_dim);
-    w->w3                    = m.get<float>(p->n_layers * p->dim * p->hidden_dim);
-    w->rms_final_weight      = m.get<float>(p->dim);
-    w->freq_cis_real         = m.get<float>(p->seq_len * head_size / 2);
-    w->freq_cis_imag         = m.get<float>(p->seq_len * head_size / 2);
-    w->wcls = shared_weights ? w->token_embedding_table : m.get<float>(0);
+    w->token_embedding_table = m.get_ptr<float>(p.vocab_size * p.dim);
+    w->rms_att_weight        = m.get_ptr<float>(p.n_layers * p.dim);
+    w->wq                    = m.get_ptr<float>(p.n_layers * p.dim * p.dim);
+    w->wk                    = m.get_ptr<float>(p.n_layers * p.dim * p.dim);
+    w->wv                    = m.get_ptr<float>(p.n_layers * p.dim * p.dim);
+    w->wo                    = m.get_ptr<float>(p.n_layers * p.dim * p.dim);
+    w->rms_ffn_weight        = m.get_ptr<float>(p.n_layers * p.dim);
+    w->w1                    = m.get_ptr<float>(p.n_layers * p.dim * p.hidden_dim);
+    w->w2                    = m.get_ptr<float>(p.n_layers * p.dim * p.hidden_dim);
+    w->w3                    = m.get_ptr<float>(p.n_layers * p.dim * p.hidden_dim);
+    w->rms_final_weight      = m.get_ptr<float>(p.dim);
+    w->freq_cis_real         = m.get_ptr<float>(p.seq_len * head_size / 2);
+    w->freq_cis_imag         = m.get_ptr<float>(p.seq_len * head_size / 2);
+
+    w->wcls = shared_weights ? w->token_embedding_table
+                             : m.get_ptr<float>(1);
 }
 
 // ----------------------------------------------------------------------------
@@ -382,11 +383,13 @@ int str_lookup(const string& str, const vector<string>& vocab) {
     return -1;
 }
 
-void bpe_encode(char* text, const vector<string>& vocab, vector<int>& tokens) {
+void bpe_encode(vector<int>* tokens_ptr, char* text, const vector<string>& vocab) {
 
-    // First encode every individual UTF-8 character in the input string
+    vector<int>& tokens = *tokens_ptr; // syntactic sugar
+
+    // First encode every individual character in the input string
     while (*text) {
-        // In a UTF-8 character any byte but the first has format 10xxxxxx
+        // In UTF-8 character any byte but the first has format 10xxxxxx
         char* start = text;
         do text++; while ((*text & 0xc0) == 0x80);
         int id = str_lookup(string(start, text - start), vocab);
@@ -462,48 +465,50 @@ int argmax(float* v, int n) {
     }
     return max_i;
 }
+
 // ----------------------------------------------------------------------------
 
 void init(MMap& m, Config* config, TransformerWeights* weights, vector<string>* vocab, bool* shared_weights) {
 
     int32_t x, len;
-    float dummy;
+    float score;
 
     // Read in the config header, values are int32_t on disk
     // but we want them to be size_t.
-    static const size_t Num = sizeof(Config) / sizeof(size_t);
+    static const size_t N = sizeof(Config) / sizeof(size_t);
 
     // All Config fields are size_t, so define a union with
     // an array to iterate over them.
-    typedef union { struct Config; size_t vec[Num]; } U;
+    union U { struct Config; size_t vec[N]; };
     size_t* ptr = reinterpret_cast<U*>(config)->vec;
 
-    for (size_t i = 0; i < Num; i++) {
+    for (size_t i = 0; i < N; i++) {
         m >> x;
         *ptr++ = static_cast<size_t>(x);
     }
+
     // Negative vocab size is hacky way of signaling unshared weights. bit yikes.
     x = static_cast<int32_t>(config->vocab_size);
     *shared_weights = (x > 0);
     config->vocab_size = abs(x);
 
     // Memory map the Transformer weights into the data pointer
-    init_weights(m, config, weights, shared_weights);
+    init_weights(m, weights, *config, shared_weights);
 
     // Read in the tokenizer.bin file
     MMap t("tokenizer.bin");
     t >> x; // ignore max_token_length
 
     for (size_t i = 0; i < config->vocab_size; i++) {
-        t >> dummy >> len; // ignore scores
-        char* c = t.get<char>(len);
+        t >> score >> len; // ignore scores
+        char* c = t.get_ptr<char>(len);
         vocab->push_back(string(c, len));
     }
 }
 
 int main(int argc, char* argv[]) {
 
-    // poor man's C argparse
+    // Poor man's C argparse
     char* checkpoint;         // e.g. out/model.bin
     float temperature = 0.9f; // e.g. 1.0, or 0.0
     int steps = 256;          // max number of steps to run for, 0: use seq_len
@@ -517,7 +522,7 @@ int main(int argc, char* argv[]) {
     checkpoint = argv[1];
 
     if (argc >= 3) {
-        // optional temperature. 0.0 = (deterministic) argmax sampling. 1.0 = baseline
+        // Optional temperature. 0.0 = (deterministic) argmax sampling. 1.0 = baseline
         temperature = atof(argv[2]);
     }
     if (argc >= 4) {
@@ -527,30 +532,30 @@ int main(int argc, char* argv[]) {
         prompt = argv[4];
     }
 
-    // seed rng with time. if you want deterministic behavior use temperature 0.0
+    // Seed rng with time. if you want deterministic behavior use temperature 0.0
     rng_seed = (unsigned int)time(NULL);
 
-    // read in the model.bin file
+    // Read in the model.bin file
     Config config;
     TransformerWeights weights;
     vector<string> vocab;
     bool shared_weights;
 
-    // Memory map the checkpoint file, will be unmapped on obj d'tor
+    // Memory map the checkpoint file and init weights
     MMap map(checkpoint);
     init(map, &config, &weights, &vocab, &shared_weights);
 
     // Create and init the application RunState
-    RunState state(&config, &weights);
-
-    // Right now we cannot run for more than config.seq_len steps
-    if (steps <= 0 || steps > config.seq_len)
-        steps = config.seq_len;
+    RunState state(config, weights);
 
     // Process the prompt, if any
     vector<int> prompt_tokens;
     if (prompt)
-        bpe_encode(prompt, vocab, prompt_tokens);
+        bpe_encode(&prompt_tokens, prompt, vocab);
+
+    // Right now we cannot run for more than config.seq_len steps
+    if (steps <= 0 || steps > config.seq_len)
+        steps = config.seq_len;
 
     // Start the main loop
     long start = 0;  // used to time our code, only initialized after first iteration
@@ -598,7 +603,7 @@ int main(int argc, char* argv[]) {
             start = time_in_ms();
     }
 
-    // report achieved tok/s
+    // Report achieved tok/s
     long end = time_in_ms();
     printf("\nachieved tok/s: %f\n", (steps-1) / (double)(end-start)*1000);
 
