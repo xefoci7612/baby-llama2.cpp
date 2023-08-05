@@ -240,11 +240,10 @@ long time_in_ms() {
     return time.tv_sec * 1000 + time.tv_nsec / 1000000;
 }
 
-struct RNG {
-    RNG() {
-        // Seed rng with time. if you want deterministic behavior use temperature 0.0
-        seed = (unsigned int)time(NULL);
-    }
+namespace RNG {
+
+    unsigned long long seed;
+
     unsigned int random_u32() {
         // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
         seed ^= seed >> 12;
@@ -255,15 +254,12 @@ struct RNG {
     float random_f32() { // random float32 in [0,1)
         return (random_u32() >> 8) / 16777216.0f;
     }
-    unsigned long long seed;
 };
 
 int sample(float* probabilities, int n) {
 
-    static RNG rng;
-
     // sample index from probabilities, they must sum to 1
-    float r = rng.random_f32();
+    float r = RNG::random_f32();
     float cdf = 0.0f;
     for (int i = 0; i < n; i++) {
         cdf += probabilities[i];
@@ -480,14 +476,14 @@ int str_lookup(const string& str, const vector<string>& vocab) {
     return -1;
 }
 
-void bpe_encode(vector<int>* tokens_ptr, char* text, const vector<string>& vocab) {
+void bpe_encode(vector<int>* tokens_ptr, const char* text, const vector<string>& vocab) {
 
     vector<int>& tokens = *tokens_ptr; // syntactic sugar
 
     // First encode every individual character in the input string
     while (*text) {
         // In UTF-8 character any byte but the first has format 10xxxxxx
-        char* start = text;
+        const char* start = text;
         do text++; while ((*text & 0xc0) == 0x80);
         int id = str_lookup(string(start, text - start), vocab);
         if (id == -1) { printf("First character in <%s> not in vocab\n", start); exit(1); }
@@ -571,31 +567,43 @@ long run_model(int steps, float temperature, const vector<int>& prompt_tokens, R
     return time_in_ms() - start; // elapsed time in ms
 }
 
+void error_usage() {
+    cout << "Usage:   run <checkpoint> [options]\n"
+         << "Example: run model.bin -t 0.9 -n 256 -p \"Once upon a time\"\n"
+         << "Options:\n"
+         << "  -t <float>  temperature, default 0.9\n"
+         << "  -s <int>    random seed, default time(NULL)\n"
+         << "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n"
+         << "  -p <string> prompt string, default none" << endl;
+    exit(EXIT_FAILURE);
+}
+
 int main(int argc, char* argv[]) {
 
-    // Poor man's C argparse
+    // default inits
+    RNG::seed = (unsigned int)time(NULL); // seed rng with time by default
     char* checkpoint;         // e.g. out/model.bin
-    float temperature = 0.9f; // e.g. 1.0, or 0.0
+    float temperature = 0.9f; // 0.0 = greedy & deterministic, 1.0 = max uncertainty
     int steps = 256;          // max number of steps to run for, 0: use seq_len
-    char* prompt = NULL;      // prompt string
+    string prompt;            // prompt string
 
-    // 'checkpoint' is necessary arg
-    if (argc < 2) {
-        printf("Usage: %s <checkpoint_file> [temperature] [steps] [prompt]\n", argv[0]);
-        return 1;
-    }
+    // 'checkpoint' is necessary and options and values are in pair
+    if (argc % 2 != 0)
+        error_usage();
 
     checkpoint = argv[1];
 
-    if (argc >= 3) {
-        // Optional temperature. 0.0 = (deterministic) argmax sampling. 1.0 = baseline
-        temperature = atof(argv[2]);
-    }
-    if (argc >= 4) {
-        steps = atoi(argv[3]);
-    }
-    if (argc >= 5) {
-        prompt = argv[4];
+    // Read in any optional argument
+    if (argc > 2) {
+        std::vector<std::string> opt(argv + 2, argv + argc);
+        for (int i = 0; i < opt.size(); i +=2) {
+            if      (opt[i] == "-t") temperature = stof(opt[i+1]);
+            else if (opt[i] == "-s") RNG::seed = stoi(opt[i+1]);
+            else if (opt[i] == "-n") steps = stoi(opt[i+1]);
+            else if (opt[i] == "-p") prompt = opt[i+1];
+            else
+                error_usage();
+        }
     }
 
     // Read in the model.bin file
@@ -612,8 +620,8 @@ int main(int argc, char* argv[]) {
 
     // Process the prompt, if any
     vector<int> prompt_tokens;
-    if (prompt)
-        bpe_encode(&prompt_tokens, prompt, vocab);
+    if (!prompt.empty())
+        bpe_encode(&prompt_tokens, prompt.c_str(), vocab);
 
     // Right now we cannot run for more than config.seq_len steps
     if (steps <= 0 || steps > config.seq_len)
