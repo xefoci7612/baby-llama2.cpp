@@ -105,6 +105,8 @@ struct TransformerWeights {
     float* freq_cis_imag; // (seq_len, head_size / 2)
     // (optional) classifier weights for the logits, on the last layer
     float* wcls;
+
+    void init(MMap&, const Config& p, bool shared_weights);
 };
 
 struct RunState {
@@ -161,33 +163,32 @@ RunState::RunState(const Config& p, const TransformerWeights& w) {
     key_cache   = alloc<float>(p.n_layers * p.seq_len * p.dim);
     value_cache = alloc<float>(p.n_layers * p.seq_len * p.dim);
 
-    freq_cis    = alloc<complex<float>>(p.seq_len * head_size / 2);
+    freq_cis = alloc<complex<float>>(p.seq_len * head_size / 2);
 
     // Copy the 2 loaded RoPE vectors into a single complex vector
     for (size_t i = 0; i < p.seq_len * head_size / 2; i++)
         freq_cis[i] = complex<float>(w.freq_cis_real[i], w.freq_cis_imag[i]);
 }
 
-void init_weights(MMap& m, TransformerWeights* w, const Config& p, bool shared_weights) {
+void TransformerWeights::init(MMap& m, const Config& p, bool shared_weights) {
 
     size_t head_size = p.dim / p.n_heads;
 
-    w->token_embedding_table = m.get_ptr<float>(p.vocab_size * p.dim);
-    w->rms_att_weight        = m.get_ptr<float>(p.n_layers * p.dim);
-    w->wq                    = m.get_ptr<float>(p.n_layers * p.dim * p.dim);
-    w->wk                    = m.get_ptr<float>(p.n_layers * p.dim * p.dim);
-    w->wv                    = m.get_ptr<float>(p.n_layers * p.dim * p.dim);
-    w->wo                    = m.get_ptr<float>(p.n_layers * p.dim * p.dim);
-    w->rms_ffn_weight        = m.get_ptr<float>(p.n_layers * p.dim);
-    w->w1                    = m.get_ptr<float>(p.n_layers * p.dim * p.hidden_dim);
-    w->w2                    = m.get_ptr<float>(p.n_layers * p.dim * p.hidden_dim);
-    w->w3                    = m.get_ptr<float>(p.n_layers * p.dim * p.hidden_dim);
-    w->rms_final_weight      = m.get_ptr<float>(p.dim);
-    w->freq_cis_real         = m.get_ptr<float>(p.seq_len * head_size / 2);
-    w->freq_cis_imag         = m.get_ptr<float>(p.seq_len * head_size / 2);
+    token_embedding_table = m.get_ptr<float>(p.vocab_size * p.dim);
+    rms_att_weight        = m.get_ptr<float>(p.n_layers * p.dim);
+    wq                    = m.get_ptr<float>(p.n_layers * p.dim * p.dim);
+    wk                    = m.get_ptr<float>(p.n_layers * p.dim * p.dim);
+    wv                    = m.get_ptr<float>(p.n_layers * p.dim * p.dim);
+    wo                    = m.get_ptr<float>(p.n_layers * p.dim * p.dim);
+    rms_ffn_weight        = m.get_ptr<float>(p.n_layers * p.dim);
+    w1                    = m.get_ptr<float>(p.n_layers * p.dim * p.hidden_dim);
+    w2                    = m.get_ptr<float>(p.n_layers * p.dim * p.hidden_dim);
+    w3                    = m.get_ptr<float>(p.n_layers * p.dim * p.hidden_dim);
+    rms_final_weight      = m.get_ptr<float>(p.dim);
+    freq_cis_real         = m.get_ptr<float>(p.seq_len * head_size / 2);
+    freq_cis_imag         = m.get_ptr<float>(p.seq_len * head_size / 2);
 
-    w->wcls = shared_weights ? w->token_embedding_table
-                             : m.get_ptr<float>(1);
+    wcls = shared_weights ? token_embedding_table : m.get_ptr<float>(1);
 }
 
 void init_from_mmap(MMap& m, Config* config, TransformerWeights* weights, vector<string>* vocab) {
@@ -216,7 +217,7 @@ void init_from_mmap(MMap& m, Config* config, TransformerWeights* weights, vector
     config->vocab_size = abs(x);
 
     // Memory map the Transformer weights into the data pointer
-    init_weights(m, weights, *config, shared_weights);
+    weights->init(m, *config, shared_weights);
 
     // Read in the tokenizer.bin file
     MMap t("tokenizer.bin");
@@ -515,7 +516,7 @@ void bpe_encode(vector<int>* tokens_ptr, char* text, const vector<string>& vocab
 }
 
 // ----------------------------------------------------------------------------
-// main loop where model inference is run
+// main loop to run model inference
 
 long run_model(int steps, float temperature, const vector<int>& prompt_tokens, RunState& state,
                Config& config, TransformerWeights& weights, const vector<string>& vocab) {
@@ -542,14 +543,16 @@ long run_model(int steps, float temperature, const vector<int>& prompt_tokens, R
                 next = argmax(state.logits, config.vocab_size);
             } else {
                 // apply the temperature to the logits
-                for (int q = 0; q <config.vocab_size; q++) { state.logits[q] /= temperature; }
+                for (int q = 0; q < config.vocab_size; q++)
+                    state.logits[q] /= temperature;
+
                 // apply softmax to the logits to get the probabilities for next token
                 softmax(state.logits, config.vocab_size);
+
                 // we sample from this distribution to get the next token
                 next = sample(state.logits, config.vocab_size);
             }
         }
-
         // following BOS token (1), sentencepiece decoder strips any leading whitespace (see PR #89)
         string token_str = vocab[next];
         if (token == 1 && token_str[0] == ' ')
@@ -565,7 +568,6 @@ long run_model(int steps, float temperature, const vector<int>& prompt_tokens, R
         if (start == 0)
             start = time_in_ms();
     }
-
     return time_in_ms() - start; // elapsed time in ms
 }
 

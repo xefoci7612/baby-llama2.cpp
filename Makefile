@@ -10,7 +10,7 @@ run: run.cpp
 # useful for a debug build, can then e.g. analyze with valgrind, example:
 # $ valgrind --leak-check=full ./run out/model.bin 1.0 3
 rundebug: run.cpp
-	$(CC) -g -o run run.cpp -lm
+	$(CC) -g -O1 -o run run.cpp -lm
 
 # https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html
 # https://simonbyrne.github.io/notes/fastmath/
