@@ -1,5 +1,5 @@
 /*
-Inference for Llama-2 Transformer model in pure C.
+Inference for Llama-2 Transformer model in C++
 
 Example compile: (see README for more details)
 $ g++ -O3 -o run run.cpp -lm
@@ -188,6 +188,102 @@ void init_weights(MMap& m, TransformerWeights* w, const Config& p, bool shared_w
 
     w->wcls = shared_weights ? w->token_embedding_table
                              : m.get_ptr<float>(1);
+}
+
+void init_from_mmap(MMap& m, Config* config, TransformerWeights* weights, vector<string>* vocab) {
+
+    int32_t x, len;
+    float score;
+    bool shared_weights;
+
+    // Read in the config header, values are int32_t on disk
+    // but we want them to be size_t.
+    static const size_t N = sizeof(Config) / sizeof(size_t);
+
+    // All Config fields are size_t, so define a union with
+    // an array to iterate over them.
+    union U { struct Config; size_t vec[N]; };
+    size_t* ptr = reinterpret_cast<U*>(config)->vec;
+
+    for (size_t i = 0; i < N; i++) {
+        m >> x;
+        *ptr++ = static_cast<size_t>(x);
+    }
+
+    // Negative vocab size is hacky way of signaling unshared weights. bit yikes.
+    x = static_cast<int32_t>(config->vocab_size);
+    shared_weights = (x > 0);
+    config->vocab_size = abs(x);
+
+    // Memory map the Transformer weights into the data pointer
+    init_weights(m, weights, *config, shared_weights);
+
+    // Read in the tokenizer.bin file
+    MMap t("tokenizer.bin");
+    t >> x; // ignore max_token_length
+
+    for (size_t i = 0; i < config->vocab_size; i++) {
+        t >> score >> len; // ignore scores
+        char* c = t.get_ptr<char>(len);
+        vocab->push_back(string(c, len));
+    }
+}
+
+// ----------------------------------------------------------------------------
+// utilities
+
+long time_in_ms() {
+    // return time in milliseconds, for benchmarking the model speed
+    struct timespec time;
+    clock_gettime(CLOCK_REALTIME, &time);
+    return time.tv_sec * 1000 + time.tv_nsec / 1000000;
+}
+
+struct RNG {
+    RNG() {
+        // Seed rng with time. if you want deterministic behavior use temperature 0.0
+        seed = (unsigned int)time(NULL);
+    }
+    unsigned int random_u32() {
+        // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
+        seed ^= seed >> 12;
+        seed ^= seed << 25;
+        seed ^= seed >> 27;
+        return (seed * 0x2545F4914F6CDD1Dull) >> 32;
+    }
+    float random_f32() { // random float32 in [0,1)
+        return (random_u32() >> 8) / 16777216.0f;
+    }
+    unsigned long long seed;
+};
+
+int sample(float* probabilities, int n) {
+
+    static RNG rng;
+
+    // sample index from probabilities, they must sum to 1
+    float r = rng.random_f32();
+    float cdf = 0.0f;
+    for (int i = 0; i < n; i++) {
+        cdf += probabilities[i];
+        if (r < cdf) {
+            return i;
+        }
+    }
+    return n - 1; // in case of rounding errors
+}
+
+int argmax(float* v, int n) {
+    // return argmax of v in elements 0..n
+    int max_i = 0;
+    float max_p = v[0];
+    for (int i = 1; i < n; i++) {
+        if (v[i] > max_p) {
+            max_i = i;
+            max_p = v[i];
+        }
+    }
+    return max_i;
 }
 
 // ----------------------------------------------------------------------------
@@ -419,105 +515,10 @@ void bpe_encode(vector<int>* tokens_ptr, char* text, const vector<string>& vocab
 }
 
 // ----------------------------------------------------------------------------
-// utilities
+// main loop where model inference is run
 
-long time_in_ms() {
-    // return time in milliseconds, for benchmarking the model speed
-    struct timespec time;
-    clock_gettime(CLOCK_REALTIME, &time);
-    return time.tv_sec * 1000 + time.tv_nsec / 1000000;
-}
-
-struct RNG {
-    RNG() {
-        // Seed rng with time. if you want deterministic behavior use temperature 0.0
-        seed = (unsigned int)time(NULL);
-    }
-    unsigned int random_u32() {
-        // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
-        seed ^= seed >> 12;
-        seed ^= seed << 25;
-        seed ^= seed >> 27;
-        return (seed * 0x2545F4914F6CDD1Dull) >> 32;
-    }
-    float random_f32() { // random float32 in [0,1)
-        return (random_u32() >> 8) / 16777216.0f;
-    }
-    unsigned long long seed;
-};
-
-int sample(float* probabilities, int n) {
-
-    static RNG rng;
-
-    // sample index from probabilities, they must sum to 1
-    float r = rng.random_f32();
-    float cdf = 0.0f;
-    for (int i = 0; i < n; i++) {
-        cdf += probabilities[i];
-        if (r < cdf) {
-            return i;
-        }
-    }
-    return n - 1; // in case of rounding errors
-}
-
-int argmax(float* v, int n) {
-    // return argmax of v in elements 0..n
-    int max_i = 0;
-    float max_p = v[0];
-    for (int i = 1; i < n; i++) {
-        if (v[i] > max_p) {
-            max_i = i;
-            max_p = v[i];
-        }
-    }
-    return max_i;
-}
-
-// ----------------------------------------------------------------------------
-
-void init(MMap& m, Config* config, TransformerWeights* weights,
-          vector<string>* vocab, bool* shared_weights) {
-
-    int32_t x, len;
-    float score;
-
-    // Read in the config header, values are int32_t on disk
-    // but we want them to be size_t.
-    static const size_t N = sizeof(Config) / sizeof(size_t);
-
-    // All Config fields are size_t, so define a union with
-    // an array to iterate over them.
-    union U { struct Config; size_t vec[N]; };
-    size_t* ptr = reinterpret_cast<U*>(config)->vec;
-
-    for (size_t i = 0; i < N; i++) {
-        m >> x;
-        *ptr++ = static_cast<size_t>(x);
-    }
-
-    // Negative vocab size is hacky way of signaling unshared weights. bit yikes.
-    x = static_cast<int32_t>(config->vocab_size);
-    *shared_weights = (x > 0);
-    config->vocab_size = abs(x);
-
-    // Memory map the Transformer weights into the data pointer
-    init_weights(m, weights, *config, shared_weights);
-
-    // Read in the tokenizer.bin file
-    MMap t("tokenizer.bin");
-    t >> x; // ignore max_token_length
-
-    for (size_t i = 0; i < config->vocab_size; i++) {
-        t >> score >> len; // ignore scores
-        char* c = t.get_ptr<char>(len);
-        vocab->push_back(string(c, len));
-    }
-}
-
-long run_model(int steps, float temperature, const vector<int>& prompt_tokens, Config& config,
-               RunState& state, TransformerWeights& weights, const vector<string>& vocab) {
+long run_model(int steps, float temperature, const vector<int>& prompt_tokens, RunState& state,
+               Config& config, TransformerWeights& weights, const vector<string>& vocab) {
 
     long start = 0;  // used to time our code, only initialized after first iteration
     int next;        // will store the next token in the sequence
@@ -599,11 +600,10 @@ int main(int argc, char* argv[]) {
     Config config;
     TransformerWeights weights;
     vector<string> vocab;
-    bool shared_weights;
 
     // Memory map the checkpoint file and init weights
-    MMap map(checkpoint);
-    init(map, &config, &weights, &vocab, &shared_weights);
+    MMap mmap(checkpoint);
+    init_from_mmap(mmap, &config, &weights, &vocab);
 
     // Create and init the application RunState
     RunState state(config, weights);
@@ -617,8 +617,8 @@ int main(int argc, char* argv[]) {
     if (steps <= 0 || steps > config.seq_len)
         steps = config.seq_len;
 
-    // Run the model for given number of steps
-    long elapsed = run_model(steps, temperature, prompt_tokens, config, state, weights, vocab);
+    // Run the model for the given number of steps
+    long elapsed = run_model(steps, temperature, prompt_tokens, state, config, weights, vocab);
 
     // Report achieved tok/s
     printf("\nachieved tok/s: %f\n", (steps-1) / (double)(elapsed)*1000);
