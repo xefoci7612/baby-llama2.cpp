@@ -70,7 +70,7 @@ using namespace std;
 // ----------------------------------------------------------------------------
 // Transformer and RunState structs, and related memory management
 
-typedef struct {
+struct Config {
     size_t dim; // transformer dimension
     size_t hidden_dim; // for ffn layers
     size_t n_layers; // number of layers
@@ -78,9 +78,9 @@ typedef struct {
     size_t n_kv_heads; // number of key/value heads (can be < query heads because of multiquery)
     size_t vocab_size; // vocabulary size, usually 256 (byte-level)
     size_t seq_len; // max sequence length
-} Config;
+};
 
-typedef struct {
+struct TransformerWeights {
     // token embedding table
     float* token_embedding_table; // (vocab_size, dim)
     // weights for rmsnorms
@@ -102,9 +102,9 @@ typedef struct {
     float* freq_cis_imag; // (seq_len, head_size / 2)
     // (optional) classifier weights for the logits, on the last layer
     float* wcls;
-} TransformerWeights;
+};
 
-typedef struct {
+struct RunState {
     // Current wave of activations
     float *x;   // activation at current time stamp (dim,)
     float *xb;  // same, but inside a residual branch (dim,)
@@ -121,54 +121,47 @@ typedef struct {
     float* value_cache; // (layer, seq_len, dim)
     // Helper complex vector for RoPE
     complex<float>* freq_cis; // (seq_len, head_size / 2)
-} RunState;
 
-void init_run_state(RunState* s, Config* p, TransformerWeights* w) {
+    // Poor's man memory handling
+    void* mem_vec[30] = { NULL };
+    int len = 0;
+
+    template<typename T>
+    T* alloc(size_t n) {
+        mem_vec[len] = calloc(n, sizeof(T));
+        if (!mem_vec[len]) {
+            printf("Cannot allocate run state!\n");
+            exit(1);
+        }
+        return static_cast<T*>(mem_vec[len++]);
+    }
+
+    RunState(Config*, TransformerWeights*);
+   ~RunState() { for (int i = 0; i < len; i++) free(mem_vec[i]); }
+};
+
+RunState::RunState(Config* p, TransformerWeights* w) {
 
     // We calloc instead of malloc to keep valgrind happy
     size_t head_size = p->dim / p->n_heads;
 
-    s->x = (float*)calloc(p->dim, sizeof(float));
-    s->xb = (float*)calloc(p->dim, sizeof(float));
-    s->xb2 = (float*)calloc(p->dim, sizeof(float));
-    s->hb = (float*)calloc(p->hidden_dim, sizeof(float));
-    s->hb2 = (float*)calloc(p->hidden_dim, sizeof(float));
-    s->q = (float*)calloc(p->dim, sizeof(float));
-    s->k = (float*)calloc(p->dim, sizeof(float));
-    s->v = (float*)calloc(p->dim, sizeof(float));
-    s->att = (float*)calloc(p->n_heads * p->seq_len, sizeof(float));
-    s->logits = (float*)calloc(p->vocab_size, sizeof(float));
-    s->key_cache = (float*)calloc(p->n_layers * p->seq_len * p->dim, sizeof(float));
-    s->value_cache = (float*)calloc(p->n_layers * p->seq_len * p->dim, sizeof(float));
-    s->freq_cis = (complex<float>*)calloc(p->seq_len * head_size / 2, sizeof(complex<float>));
-
-    // Ensure all memory allocations went fine
-    if (   !s->x || !s->xb || !s->xb2 || !s->hb     || !s->hb2 || !s->q
-        || !s->k || !s->v  || !s->att || !s->logits || !s->key_cache
-        || !s->value_cache || !s->freq_cis) {
-        printf("Cannot allocate run state!\n");
-        exit(1);
-    }
+    x   = alloc<float>(p->dim);
+    xb  = alloc<float>(p->dim);
+    xb2 = alloc<float>(p->dim);
+    hb  = alloc<float>(p->hidden_dim);
+    hb2 = alloc<float>(p->hidden_dim);
+    q   = alloc<float>(p->dim);
+    k   = alloc<float>(p->dim);
+    v   = alloc<float>(p->dim);
+    att = alloc<float>(p->n_heads * p->seq_len);
+    logits      = alloc<float>(p->vocab_size);
+    key_cache   = alloc<float>(p->n_layers * p->seq_len * p->dim);
+    value_cache = alloc<float>(p->n_layers * p->seq_len * p->dim);
+    freq_cis    = alloc<complex<float>>(p->seq_len * head_size / 2);
 
     // Copy loaded RoPE vectors into a single complex vector
     for (size_t i = 0; i < p->seq_len * head_size / 2; i++)
-        s->freq_cis[i] = complex<float>(w->freq_cis_real[i], w->freq_cis_imag[i]);
-}
-
-void free_run_state(RunState* s) {
-    free(s->x);
-    free(s->xb);
-    free(s->xb2);
-    free(s->hb);
-    free(s->hb2);
-    free(s->q);
-    free(s->k);
-    free(s->v);
-    free(s->att);
-    free(s->logits);
-    free(s->key_cache);
-    free(s->value_cache);
-    free(s->freq_cis);
+        freq_cis[i] = complex<float>(w->freq_cis_real[i], w->freq_cis_imag[i]);
 }
 
 // ----------------------------------------------------------------------------
@@ -551,20 +544,19 @@ int main(int argc, char* argv[]) {
     MMap map(checkpoint);
     init(map, &config, &weights, &vocab, &shared_weights);
 
-    // right now we cannot run for more than config.seq_len steps
+    // Create and init the application RunState
+    RunState state(&config, &weights);
+
+    // Right now we cannot run for more than config.seq_len steps
     if (steps <= 0 || steps > config.seq_len)
         steps = config.seq_len;
 
-    // process the prompt, if any
+    // Process the prompt, if any
     vector<int> prompt_tokens;
     if (prompt)
         bpe_encode(prompt, vocab, prompt_tokens);
 
-    // create and init the application RunState
-    RunState state;
-    init_run_state(&state, &config, &weights);
-
-    // start the main loop
+    // Start the main loop
     long start = 0;  // used to time our code, only initialized after first iteration
     int next;        // will store the next token in the sequence
     int token = 1;   // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
@@ -613,9 +605,6 @@ int main(int argc, char* argv[]) {
     // report achieved tok/s
     long end = time_in_ms();
     printf("\nachieved tok/s: %f\n", (steps-1) / (double)(end-start)*1000);
-
-    // memory and file handles cleanup
-    free_run_state(&state);
 
     return 0;
 }
