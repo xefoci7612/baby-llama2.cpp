@@ -27,6 +27,11 @@ $ ./run
 #include <sys/stat.h>
 #include <memory>
 
+using namespace std;
+
+// ----------------------------------------------------------------------------
+// Memory mapping facility to load model file
+
 class MMap {
 public:
     MMap(const char* file) {
@@ -64,8 +69,6 @@ private:
     void* data;
     char* cur;
 };
-
-using namespace std;
 
 // ----------------------------------------------------------------------------
 // Transformer and RunState structs, and related memory management
@@ -122,12 +125,13 @@ struct RunState {
     // Helper complex vector for RoPE
     complex<float>* freq_cis; // (seq_len, head_size / 2)
 
-    // Poor's man memory handling
-    void* mem_vec[30] = { NULL };
+    // Poor's man memory management
+    void* mem_vec[20] = { NULL };
     int len = 0;
 
     template<typename T>
     T* alloc(size_t n) {
+        // We calloc instead of malloc to keep valgrind happy
         mem_vec[len] = calloc(n, sizeof(T));
         if (!mem_vec[len]) {
             printf("Cannot allocate run state!\n");
@@ -142,7 +146,6 @@ struct RunState {
 
 RunState::RunState(Config* p, TransformerWeights* w) {
 
-    // We calloc instead of malloc to keep valgrind happy
     size_t head_size = p->dim / p->n_heads;
 
     x   = alloc<float>(p->dim);
@@ -372,7 +375,6 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 // byte pair encoding (BPE) tokenizer, encodes strings into tokens so we can prompt
 
 int str_lookup(const string& str, const vector<string>& vocab) {
-    // Find first match for str in vocab, return its index or -1 if not found
     for (int i = 0; i < vocab.size(); i++) {
         if (str == vocab[i])
             return i;
@@ -380,21 +382,15 @@ int str_lookup(const string& str, const vector<string>& vocab) {
     return -1;
 }
 
-// Extract next UTF-8 character updating the pointer
-string next_utf8(char*& text) {
-
-    // In UTF-8 multi-byte any byte but the first has format 10xxxxxx
-    char* start = text++;
-    while ((*text & 0xc0) == 0x80) { text++; }
-    return string(start, text - start);
-}
-
 void bpe_encode(char* text, const vector<string>& vocab, vector<int>& tokens) {
 
     // First encode every individual UTF-8 character in the input string
     while (*text) {
-        int id = str_lookup(next_utf8(text), vocab);
-        if (id == -1) { printf("UTF-8 character not in vocab\n"); exit(1); }
+        // In a UTF-8 character any byte but the first has format 10xxxxxx
+        char* start = text;
+        do text++; while ((*text & 0xc0) == 0x80);
+        int id = str_lookup(string(start, text - start), vocab);
+        if (id == -1) { printf("First character in <%s> not in vocab\n", start); exit(1); }
         tokens.push_back(id);
     }
 
