@@ -468,7 +468,8 @@ int argmax(float* v, int n) {
 
 // ----------------------------------------------------------------------------
 
-void init(MMap& m, Config* config, TransformerWeights* weights, vector<string>* vocab, bool* shared_weights) {
+void init(MMap& m, Config* config, TransformerWeights* weights,
+          vector<string>* vocab, bool* shared_weights) {
 
     int32_t x, len;
     float score;
@@ -506,62 +507,14 @@ void init(MMap& m, Config* config, TransformerWeights* weights, vector<string>* 
     }
 }
 
-int main(int argc, char* argv[]) {
+long run_model(int steps, float temperature, const vector<int>& prompt_tokens, Config& config,
+               RunState& state, TransformerWeights& weights, const vector<string>& vocab) {
 
-    // Poor man's C argparse
-    char* checkpoint;         // e.g. out/model.bin
-    float temperature = 0.9f; // e.g. 1.0, or 0.0
-    int steps = 256;          // max number of steps to run for, 0: use seq_len
-    char* prompt = NULL;      // prompt string
-
-    // 'checkpoint' is necessary arg
-    if (argc < 2) {
-        printf("Usage: %s <checkpoint_file> [temperature] [steps] [prompt]\n", argv[0]);
-        return 1;
-    }
-    checkpoint = argv[1];
-
-    if (argc >= 3) {
-        // Optional temperature. 0.0 = (deterministic) argmax sampling. 1.0 = baseline
-        temperature = atof(argv[2]);
-    }
-    if (argc >= 4) {
-        steps = atoi(argv[3]);
-    }
-    if (argc >= 5) {
-        prompt = argv[4];
-    }
-
-    // Seed rng with time. if you want deterministic behavior use temperature 0.0
-    rng_seed = (unsigned int)time(NULL);
-
-    // Read in the model.bin file
-    Config config;
-    TransformerWeights weights;
-    vector<string> vocab;
-    bool shared_weights;
-
-    // Memory map the checkpoint file and init weights
-    MMap map(checkpoint);
-    init(map, &config, &weights, &vocab, &shared_weights);
-
-    // Create and init the application RunState
-    RunState state(config, weights);
-
-    // Process the prompt, if any
-    vector<int> prompt_tokens;
-    if (prompt)
-        bpe_encode(&prompt_tokens, prompt, vocab);
-
-    // Right now we cannot run for more than config.seq_len steps
-    if (steps <= 0 || steps > config.seq_len)
-        steps = config.seq_len;
-
-    // Start the main loop
     long start = 0;  // used to time our code, only initialized after first iteration
     int next;        // will store the next token in the sequence
     int token = 1;   // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
     int pos = 0;     // position in the sequence
+
     printf("<s>\n"); // explicit print the initial BOS token for stylistic symmetry reasons
 
     while (pos < steps) {
@@ -603,9 +556,66 @@ int main(int argc, char* argv[]) {
             start = time_in_ms();
     }
 
+    return time_in_ms() - start; // elapsed time in ms
+}
+
+int main(int argc, char* argv[]) {
+
+    // Poor man's C argparse
+    char* checkpoint;         // e.g. out/model.bin
+    float temperature = 0.9f; // e.g. 1.0, or 0.0
+    int steps = 256;          // max number of steps to run for, 0: use seq_len
+    char* prompt = NULL;      // prompt string
+
+    // Seed rng with time. if you want deterministic behavior use temperature 0.0
+    rng_seed = (unsigned int)time(NULL);
+
+    // 'checkpoint' is necessary arg
+    if (argc < 2) {
+        printf("Usage: %s <checkpoint_file> [temperature] [steps] [prompt]\n", argv[0]);
+        return 1;
+    }
+
+    checkpoint = argv[1];
+
+    if (argc >= 3) {
+        // Optional temperature. 0.0 = (deterministic) argmax sampling. 1.0 = baseline
+        temperature = atof(argv[2]);
+    }
+    if (argc >= 4) {
+        steps = atoi(argv[3]);
+    }
+    if (argc >= 5) {
+        prompt = argv[4];
+    }
+
+    // Read in the model.bin file
+    Config config;
+    TransformerWeights weights;
+    vector<string> vocab;
+    bool shared_weights;
+
+    // Memory map the checkpoint file and init weights
+    MMap map(checkpoint);
+    init(map, &config, &weights, &vocab, &shared_weights);
+
+    // Create and init the application RunState
+    RunState state(config, weights);
+
+    // Process the prompt, if any
+    vector<int> prompt_tokens;
+    if (prompt)
+        bpe_encode(&prompt_tokens, prompt, vocab);
+
+    // Right now we cannot run for more than config.seq_len steps
+    if (steps <= 0 || steps > config.seq_len)
+        steps = config.seq_len;
+
+    // Run the model for given number of steps
+    long elapsed = run_model(steps, temperature, prompt_tokens, config, state, weights, vocab);
+
     // Report achieved tok/s
-    long end = time_in_ms();
-    printf("\nachieved tok/s: %f\n", (steps-1) / (double)(end-start)*1000);
+    printf("\nachieved tok/s: %f\n", (steps-1) / (double)(elapsed)*1000);
 
     return 0;
 }
