@@ -428,21 +428,30 @@ long time_in_ms() {
     return time.tv_sec * 1000 + time.tv_nsec / 1000000;
 }
 
-unsigned long long rng_seed;
-unsigned int random_u32() {
-    // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
-    rng_seed ^= rng_seed >> 12;
-    rng_seed ^= rng_seed << 25;
-    rng_seed ^= rng_seed >> 27;
-    return (rng_seed * 0x2545F4914F6CDD1Dull) >> 32;
-}
-float random_f32() { // random float32 in [0,1)
-    return (random_u32() >> 8) / 16777216.0f;
-}
+struct RNG {
+    RNG() {
+        // Seed rng with time. if you want deterministic behavior use temperature 0.0
+        seed = (unsigned int)time(NULL);
+    }
+    unsigned int random_u32() {
+        // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
+        seed ^= seed >> 12;
+        seed ^= seed << 25;
+        seed ^= seed >> 27;
+        return (seed * 0x2545F4914F6CDD1Dull) >> 32;
+    }
+    float random_f32() { // random float32 in [0,1)
+        return (random_u32() >> 8) / 16777216.0f;
+    }
+    unsigned long long seed;
+};
 
 int sample(float* probabilities, int n) {
+
+    static RNG rng;
+
     // sample index from probabilities, they must sum to 1
-    float r = random_f32();
+    float r = rng.random_f32();
     float cdf = 0.0f;
     for (int i = 0; i < n; i++) {
         cdf += probabilities[i];
@@ -566,9 +575,6 @@ int main(int argc, char* argv[]) {
     float temperature = 0.9f; // e.g. 1.0, or 0.0
     int steps = 256;          // max number of steps to run for, 0: use seq_len
     char* prompt = NULL;      // prompt string
-
-    // Seed rng with time. if you want deterministic behavior use temperature 0.0
-    rng_seed = (unsigned int)time(NULL);
 
     // 'checkpoint' is necessary arg
     if (argc < 2) {
