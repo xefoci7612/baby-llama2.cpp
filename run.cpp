@@ -38,13 +38,13 @@ public:
         struct stat fileInfo;
         int fd = open(file, O_RDONLY);
         if (fd == -1 || stat(file, &fileInfo) == -1) {
-            printf("Couldn't open file %s\n", file);
+            fprintf(stderr, "Couldn't open file %s\n", file);
             exit(EXIT_FAILURE);
         }
         size = fileInfo.st_size;
         data = mmap(NULL, fileInfo.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
         if (data == MAP_FAILED) {
-            printf("mmap failed!\n");
+            fprintf(stderr, "mmap failed!\n");
             exit(EXIT_FAILURE);
         }
         cur = static_cast<char*>(data);
@@ -137,7 +137,7 @@ struct RunState {
         // We calloc instead of malloc to keep valgrind happy
         mem_vec[len] = calloc(n, sizeof(T));
         if (!mem_vec[len]) {
-            printf("Cannot allocate run state!\n");
+            fprintf(stderr, "Cannot allocate run state!\n");
             exit(EXIT_FAILURE);
         }
         return static_cast<T*>(mem_vec[len++]);
@@ -515,7 +515,7 @@ void bpe_encode(vector<int>* tokens_ptr, const char* text, const vector<string>&
         do text++; while ((*text & 0xc0) == 0x80);
         int id = str_lookup(string(start, text - start), vocab);
         if (id == -1) {
-            printf("First character in <%s> not in vocab\n", start);
+            fprintf(stderr, "First character in <%s> not in vocab\n", start);
             exit(EXIT_FAILURE);
         }
         tokens.push_back(id);
@@ -599,7 +599,7 @@ long run_model(int steps, float temperature, float topp, const vector<int>& prom
 }
 
 void error_usage() {
-    cout << "Usage:   run <checkpoint> [options]\n"
+    cerr << "Usage:   run <checkpoint> [options]\n"
             "Example: run model.bin -n 256 -i \"Once upon a time\"\n"
             "Options:\n"
             "  -t <float>  temperature, default 1.0\n"
@@ -633,7 +633,7 @@ int main(int argc, char* argv[]) {
         for (int i = 0; i < opt.size(); i += 2) {
             if      (opt[i] == "-t") temperature = stof(opt[i+1]);
             else if (opt[i] == "-p") topp = stof(opt[i+1]);
-            else if (opt[i] == "-s") RNG::seed = stoi(opt[i+1]);
+            else if (opt[i] == "-s") RNG::seed = stoi(opt[i+1]); // FIXME cannot be 0
             else if (opt[i] == "-n") steps = stoi(opt[i+1]);
             else if (opt[i] == "-i") prompt = opt[i+1];
             else
@@ -666,7 +666,7 @@ int main(int argc, char* argv[]) {
     long elapsed = run_model(steps, temperature, topp, prompt_tokens, state, config, weights, vocab);
 
     // Report achieved tok/s
-    printf("\nachieved tok/s: %f\n", (steps-1) / (double)(elapsed)*1000);
+    fprintf(stderr, "\nachieved tok/s: %f\n", (steps-1) / (double)(elapsed)*1000);
 
     return 0;
 }
