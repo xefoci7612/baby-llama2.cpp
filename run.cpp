@@ -565,7 +565,7 @@ void bpe_encode(vector<int>* tokens_ptr, const char* text, const vector<string>&
 // ----------------------------------------------------------------------------
 // main loop, runs model inference
 
-long run_model(int steps, float temperature, const vector<int>& prompt_tokens, RunState& state,
+long run_model(int steps, float temperature, float topp, const vector<int>& prompt_tokens, RunState& state,
                Config& config, TransformerWeights& weights, const vector<string>& vocab) {
 
     long start = 0;  // used to time our code, only initialized after first iteration
@@ -597,7 +597,13 @@ long run_model(int steps, float temperature, const vector<int>& prompt_tokens, R
                 softmax(state.logits, config.vocab_size);
 
                 // we sample from this distribution to get the next token
-                next = sample(state.logits, config.vocab_size);
+                if (topp <= 0) {
+                    // simply sample from the predicted probability distribution
+                    next = sample(state.logits, config.vocab_size);
+                } else {
+                    // top-p (nucleus) sampling, clamping the least likely tokens to zero
+                    next = sample_topp(state.logits, config.vocab_size, topp, state.probindex);
+                }
             }
         }
         // following BOS token (1), sentencepiece decoder strips any leading whitespace (see PR #89)
@@ -684,7 +690,7 @@ int main(int argc, char* argv[]) {
         steps = config.seq_len;
 
     // Run the model for the given number of steps
-    long elapsed = run_model(steps, temperature, prompt_tokens, state, config, weights, vocab);
+    long elapsed = run_model(steps, temperature, topp, prompt_tokens, state, config, weights, vocab);
 
     // Report achieved tok/s
     printf("\nachieved tok/s: %f\n", (steps-1) / (double)(elapsed)*1000);
