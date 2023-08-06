@@ -8,17 +8,17 @@ run: run.cpp
 	$(CC) -O3 -o run run.cpp -lm
 
 # useful for a debug build, can then e.g. analyze with valgrind, example:
-# $ valgrind --leak-check=full ./run out/model.bin 1.0 3
+# $ valgrind --leak-check=full ./run out/model.bin -n 3
 rundebug: run.cpp
 	$(CC) -g -O1 -o run run.cpp -lm
 
 # https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html
 # https://simonbyrne.github.io/notes/fastmath/
-# -Ofast enables all -O3 optimizations. 
+# -Ofast enables all -O3 optimizations.
 # Disregards strict standards compliance.
-# It also enables optimizations that are not valid for all standard-compliant programs. 
-# It turns on -ffast-math, -fallow-store-data-races and the Fortran-specific 
-# -fstack-arrays, unless -fmax-stack-var-size is specified, and -fno-protect-parens. 
+# It also enables optimizations that are not valid for all standard-compliant programs.
+# It turns on -ffast-math, -fallow-store-data-races and the Fortran-specific
+# -fstack-arrays, unless -fmax-stack-var-size is specified, and -fno-protect-parens.
 # It turns off -fsemantic-interposition.
 # In our specific application this is *probably* okay to use
 .PHONY: runfast
@@ -33,7 +33,7 @@ runomp: run.cpp
 	$(CC) -Ofast -fopenmp -march=native run.cpp  -lm  -o run
 
 .PHONY: win64
-win64: 
+win64:
 	x86_64-w64-mingw32-gcc-win32 -Ofast -D_WIN32 -o run.exe -I. run.cpp win.c
 
 # compiles with gnu99 standard flags for amazon linux, coreos, etc. compatibility

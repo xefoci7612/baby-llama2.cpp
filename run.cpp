@@ -38,13 +38,13 @@ public:
         int fd = open(file, O_RDONLY);
         if (fd == -1 || stat(file, &fileInfo) == -1) {
             printf("Couldn't open file %s\n", file);
-            exit(1);
+            exit(EXIT_FAILURE);
         }
         size = fileInfo.st_size;
         data = mmap(NULL, fileInfo.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
         if (data == MAP_FAILED) {
             printf("mmap failed!\n");
-            exit(1);
+            exit(EXIT_FAILURE);
         }
         cur = static_cast<char*>(data);
         close(fd); // we can close the file once mapped
@@ -137,7 +137,7 @@ struct RunState {
         mem_vec[len] = calloc(n, sizeof(T));
         if (!mem_vec[len]) {
             printf("Cannot allocate run state!\n");
-            exit(1);
+            exit(EXIT_FAILURE);
         }
         return static_cast<T*>(mem_vec[len++]);
     }
@@ -486,33 +486,32 @@ void bpe_encode(vector<int>* tokens_ptr, const char* text, const vector<string>&
         const char* start = text;
         do text++; while ((*text & 0xc0) == 0x80);
         int id = str_lookup(string(start, text - start), vocab);
-        if (id == -1) { printf("First character in <%s> not in vocab\n", start); exit(1); }
+        if (id == -1) {
+            printf("First character in <%s> not in vocab\n", start);
+            exit(EXIT_FAILURE);
+        }
         tokens.push_back(id);
     }
 
     // Merge consecutive tokens until there are no more new merges
-    int merge_found = 1;
-    while (merge_found) {
-        merge_found = 0;
+    while (true) {
         int i = 0;
         for (int next = i+1; next < tokens.size(); next++) {
             // check if we can merge the pair (token[i], token[next])
             int id = str_lookup(vocab[tokens[i]] + vocab[tokens[next]], vocab);
-            if (id != -1) {
+            if (id == -1)
+                tokens[++i] = tokens[next]; // can't merge further, move to next
+            else
                 tokens[i] = id; // merge next token
-                merge_found = 1;
-            } else {
-                // we cannot merge further, proceed with next token
-                i++;
-                tokens[i] = tokens[next];
-            }
         }
+        if (tokens.size() == i+1)
+            break; // no new merges in the last iteration
         tokens.resize(i+1);
     }
 }
 
 // ----------------------------------------------------------------------------
-// main loop to run model inference
+// main loop, runs model inference
 
 long run_model(int steps, float temperature, const vector<int>& prompt_tokens, RunState& state,
                Config& config, TransformerWeights& weights, const vector<string>& vocab) {
@@ -564,30 +563,32 @@ long run_model(int steps, float temperature, const vector<int>& prompt_tokens, R
         if (start == 0)
             start = time_in_ms();
     }
+
     return time_in_ms() - start; // elapsed time in ms
 }
 
 void error_usage() {
     cout << "Usage:   run <checkpoint> [options]\n"
-         << "Example: run model.bin -t 0.9 -n 256 -p \"Once upon a time\"\n"
-         << "Options:\n"
-         << "  -t <float>  temperature, default 0.9\n"
-         << "  -s <int>    random seed, default time(NULL)\n"
-         << "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n"
-         << "  -p <string> prompt string, default none" << endl;
+            "Example: run model.bin -t 0.9 -n 256 -p \"Once upon a time\"\n"
+            "Options:\n"
+            "  -t <float>  temperature, default 0.9\n"
+            "  -s <int>    random seed, default time(NULL)\n"
+            "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n"
+            "  -p <string> prompt string, default none" << endl;
     exit(EXIT_FAILURE);
 }
 
 int main(int argc, char* argv[]) {
 
     // default inits
-    RNG::seed = (unsigned int)time(NULL); // seed rng with time by default
     char* checkpoint;         // e.g. out/model.bin
     float temperature = 0.9f; // 0.0 = greedy & deterministic, 1.0 = max uncertainty
     int steps = 256;          // max number of steps to run for, 0: use seq_len
     string prompt;            // prompt string
+    RNG::seed = (unsigned int)time(NULL); // seed rng with time by default
 
-    // 'checkpoint' is necessary and options and values are in pair
+    // 'checkpoint' is necessary, optional arguments and their values
+    // come in pairs, so argc must be even.
     if (argc % 2 != 0)
         error_usage();
 
@@ -595,8 +596,8 @@ int main(int argc, char* argv[]) {
 
     // Read in any optional argument
     if (argc > 2) {
-        std::vector<std::string> opt(argv + 2, argv + argc);
-        for (int i = 0; i < opt.size(); i +=2) {
+        vector<string> opt(argv + 2, argv + argc);
+        for (int i = 0; i < opt.size(); i += 2) {
             if      (opt[i] == "-t") temperature = stof(opt[i+1]);
             else if (opt[i] == "-s") RNG::seed = stoi(opt[i+1]);
             else if (opt[i] == "-n") steps = stoi(opt[i+1]);
