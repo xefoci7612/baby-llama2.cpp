@@ -109,6 +109,11 @@ struct TransformerWeights {
     void init(MMap&, const Config& p, bool shared_weights);
 };
 
+struct ProbIndex { // used when sorting probabilities during top-p sampling
+    float prob;
+    int index;
+};
+
 struct RunState {
     // Current wave of activations
     float* x;   // activation at current time stamp (dim,)
@@ -121,6 +126,7 @@ struct RunState {
     float* v;   // value (dim,)
     float* att; // buffer for scores/attention values (n_heads, seq_len)
     float* logits; // output logits
+    ProbIndex* probindex; // buffer used in top-p sampling
     // Key and Value cache
     float* key_cache;   // (layer, seq_len, dim)
     float* value_cache; // (layer, seq_len, dim)
@@ -160,6 +166,7 @@ RunState::RunState(const Config& p, const TransformerWeights& w) {
     v   = alloc<float>(p.dim);
     att = alloc<float>(p.n_heads * p.seq_len);
     logits      = alloc<float>(p.vocab_size);
+    probindex   = alloc<ProbIndex>(p.vocab_size);
     key_cache   = alloc<float>(p.n_layers * p.seq_len * p.dim);
     value_cache = alloc<float>(p.n_layers * p.seq_len * p.dim);
 
@@ -231,7 +238,7 @@ void init_from_mmap(MMap& m, Config* config, TransformerWeights* weights, vector
 }
 
 // ----------------------------------------------------------------------------
-// utilities
+// utilities: time / rng
 
 long time_in_ms() {
     // return time in milliseconds, for benchmarking the model speed
@@ -242,7 +249,7 @@ long time_in_ms() {
 
 namespace RNG {
 
-    unsigned long long seed = 0x2545F4914F6CDD1Dull; // Cannot be 0
+    unsigned long long seed; // Should be set before use, cannot be 0
 
     unsigned int random_u32() {
         // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
@@ -256,9 +263,24 @@ namespace RNG {
     }
 };
 
-int sample(float* probabilities, int n) {
+// ----------------------------------------------------------------------------
+// sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
 
-    // sample index from probabilities, they must sum to 1
+int argmax(float* probabilities, int n) {
+    // return the index that has the highest probability
+    int max_i = 0;
+    float max_p = probabilities[0];
+    for (int i = 1; i < n; i++) {
+        if (probabilities[i] > max_p) {
+            max_i = i;
+            max_p = probabilities[i];
+        }
+    }
+    return max_i;
+}
+
+int sample(float* probabilities, int n) {
+    // sample index from probabilities (they must sum to 1!)
     float r = RNG::random_f32();
     float cdf = 0.0f;
     for (int i = 0; i < n; i++) {
@@ -270,17 +292,47 @@ int sample(float* probabilities, int n) {
     return n - 1; // in case of rounding errors
 }
 
-int argmax(float* v, int n) {
-    // return argmax of v in elements 0..n
-    int max_i = 0;
-    float max_p = v[0];
-    for (int i = 1; i < n; i++) {
-        if (v[i] > max_p) {
-            max_i = i;
-            max_p = v[i];
+int compare(const void* a, const void* b) {
+    ProbIndex* a_ = (ProbIndex*) a;
+    ProbIndex* b_ = (ProbIndex*) b;
+    if (a_->prob > b_->prob) return -1;
+    if (a_->prob < b_->prob) return 1;
+    return 0;
+}
+
+int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex) {
+    // top-p sampling (or "nucleus sampling") samples from the smallest set of
+    // tokens that exceed probability topp. This way we never sample tokens that
+    // have very low probabilities and are less likely to go "off the rails".
+
+    // quicksort indices in descending order of probabilities
+    for (int i = 0; i < n; i++) {
+        probindex[i].index = i;
+        probindex[i].prob = probabilities[i];
+    }
+    qsort(probindex, n, sizeof(ProbIndex), compare);
+
+    // truncate the list where cumulative probability exceeds topp
+    float cumulative_prob = 0.0f;
+    int last_idx = 0;
+    for (int i = 0; i < n; i++) {
+        cumulative_prob += probindex[i].prob;
+        if (cumulative_prob > topp) {
+            last_idx = i;
+            break; // we've exceeded topp by including last_idx
         }
     }
-    return max_i;
+
+    // sample from the truncated list
+    float r = RNG::random_f32() * cumulative_prob;
+    float cdf = 0.0f;
+    for (int i = 0; i <= last_idx; i++) {
+        cdf += probindex[i].prob;
+        if (r < cdf) {
+            return probindex[i].index;
+        }
+    }
+    return probindex[last_idx].index; // in case of rounding errors
 }
 
 // ----------------------------------------------------------------------------
@@ -569,12 +621,13 @@ long run_model(int steps, float temperature, const vector<int>& prompt_tokens, R
 
 void error_usage() {
     cout << "Usage:   run <checkpoint> [options]\n"
-            "Example: run model.bin -t 0.9 -n 256 -p \"Once upon a time\"\n"
+            "Example: run model.bin -n 256 -i \"Once upon a time\"\n"
             "Options:\n"
-            "  -t <float>  temperature, default 0.9\n"
+            "  -t <float>  temperature, default 1.0\n"
+            "  -p <float>  p value in top-p (nucleus) sampling. default 0.9, 0 = off\n"
             "  -s <int>    random seed, default time(NULL)\n"
             "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n"
-            "  -p <string> prompt string, default none" << endl;
+            "  -i <string> input prompt\n" << endl;
     exit(EXIT_FAILURE);
 }
 
@@ -582,10 +635,11 @@ int main(int argc, char* argv[]) {
 
     // default inits
     char* checkpoint;         // e.g. out/model.bin
-    float temperature = 0.9f; // 0.0 = greedy & deterministic, 1.0 = max uncertainty
+    float temperature = 1.0f; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
+    float topp = 0.9f;        // top-p in nucleus sampling
     int steps = 256;          // max number of steps to run for, 0: use seq_len
     string prompt;            // prompt string
-    RNG::seed = (unsigned int)time(NULL); // seed rng with time by default
+    RNG::seed = (unsigned int)time(NULL); // seed rng with time by default, ensures != 0
 
     // 'checkpoint' is necessary, optional arguments and their values
     // come in pairs, so argc must be even.
@@ -599,9 +653,10 @@ int main(int argc, char* argv[]) {
         vector<string> opt(argv + 2, argv + argc);
         for (int i = 0; i < opt.size(); i += 2) {
             if      (opt[i] == "-t") temperature = stof(opt[i+1]);
+            else if (opt[i] == "-p") topp = stof(opt[i+1]);
             else if (opt[i] == "-s") RNG::seed ^= stoi(opt[i+1]); // xor ensures seed != 0
             else if (opt[i] == "-n") steps = stoi(opt[i+1]);
-            else if (opt[i] == "-p") prompt = opt[i+1];
+            else if (opt[i] == "-i") prompt = opt[i+1];
             else
                 error_usage();
         }
