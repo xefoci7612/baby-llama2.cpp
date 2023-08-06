@@ -242,7 +242,7 @@ long time_in_ms() {
 
 namespace RNG {
 
-    unsigned long long seed;
+    unsigned long long seed = 0x2545F4914F6CDD1Dull; // Cannot be 0
 
     unsigned int random_u32() {
         // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
@@ -599,7 +599,7 @@ int main(int argc, char* argv[]) {
         vector<string> opt(argv + 2, argv + argc);
         for (int i = 0; i < opt.size(); i += 2) {
             if      (opt[i] == "-t") temperature = stof(opt[i+1]);
-            else if (opt[i] == "-s") RNG::seed = stoi(opt[i+1]);
+            else if (opt[i] == "-s") RNG::seed ^= stoi(opt[i+1]); // xor ensures seed != 0
             else if (opt[i] == "-n") steps = stoi(opt[i+1]);
             else if (opt[i] == "-p") prompt = opt[i+1];
             else
