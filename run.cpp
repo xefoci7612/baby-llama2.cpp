@@ -21,6 +21,7 @@ $ ./run
     #include <sys/mman.h>
 #endif
 
+#include <algorithm>
 #include <complex>
 #include <iostream>
 #include <vector>
@@ -279,9 +280,49 @@ int argmax(float* probabilities, int n) {
     return max_i;
 }
 
-int sample(float* probabilities, int n) {
+// top-p sampling (or "nucleus sampling") samples from the smallest set of
+// tokens that exceed probability topp. This way we never sample tokens that
+// have very low probabilities and are less likely to go "off the rails".
+//
+// if topp <= 0 simply sample from the predicted probability distribution
+int sample2(float* prob, float topp, const vector<int>& range_vec, float rnd) {
+
+    vector v(range_vec); // init with 1..vocab_size range
+    float cumulative_prob = 1.0f;
+
+    if (topp > 0) {
+        // sort v in descending order of indexed probabilities
+        std::sort(v.begin(), v.end(), [&prob](int i1, int i2) { return prob[i1] > prob[i2]; });
+
+        // truncate the list where cumulative probability exceeds topp
+        cumulative_prob = 0.0f;
+        for (size_t i = 0; i < v.size(); i++) {
+            cumulative_prob += prob[v[i]];
+            if (cumulative_prob > topp) {
+                v.resize(i+1);
+                break; // we've exceeded topp by including last_idx
+            }
+        }
+    }
+
+    // sample index from probabilities (they must sum to 1 * cumulative_prob!)
+    //float r = RNG::random_f32() * cumulative_prob;
+    float r = rnd * cumulative_prob; // Debug!!
+
+    float cdf = 0.0f;
+    for (size_t i = 0; i < v.size(); i++) {
+        cdf += prob[v[i]];
+        if (r < cdf) {
+            return v[i];
+        }
+    }
+
+    return v.back(); // in case of rounding errors
+}
+
+int sample(float* probabilities, int n, float rnd) {
     // sample index from probabilities (they must sum to 1!)
-    float r = RNG::random_f32();
+    float r = rnd; // RNG::random_f32();
     float cdf = 0.0f;
     for (int i = 0; i < n; i++) {
         cdf += probabilities[i];
@@ -300,7 +341,7 @@ int compare(const void* a, const void* b) {
     return 0;
 }
 
-int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex) {
+int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, float rnd) {
     // top-p sampling (or "nucleus sampling") samples from the smallest set of
     // tokens that exceed probability topp. This way we never sample tokens that
     // have very low probabilities and are less likely to go "off the rails".
@@ -324,7 +365,8 @@ int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex) {
     }
 
     // sample from the truncated list
-    float r = RNG::random_f32() * cumulative_prob;
+    //float r = RNG::random_f32() * cumulative_prob;
+    float r = rnd * cumulative_prob;
     float cdf = 0.0f;
     for (int i = 0; i <= last_idx; i++) {
         cdf += probindex[i].prob;
@@ -575,6 +617,9 @@ long run_model(int steps, float temperature, float topp, const vector<int>& prom
 
     printf("<s>\n"); // explicit print the initial BOS token for stylistic symmetry reasons
 
+    vector<int> range_vec(config.vocab_size);
+    for (int i = 0; i < range_vec.size(); i++) { range_vec[i] = i; }
+
     while (pos < steps) {
 
         // forward the transformer to get logits for the next token
@@ -596,13 +641,29 @@ long run_model(int steps, float temperature, float topp, const vector<int>& prom
                 // apply softmax to the logits to get the probabilities for next token
                 softmax(state.logits, config.vocab_size);
 
+                float rnd = RNG::random_f32();
+
                 // we sample from this distribution to get the next token
                 if (topp <= 0) {
                     // simply sample from the predicted probability distribution
-                    next = sample(state.logits, config.vocab_size);
+                    next = sample(state.logits, config.vocab_size, rnd);
+
+                    int next2 = sample2(state.logits, topp, range_vec, rnd);
+
+                    if (next != next2) {
+                        printf("\nSampling error 1 <%s> <%s>\n", vocab[next].c_str(), vocab[next2].c_str());
+                        exit(EXIT_FAILURE);
+                    }
                 } else {
                     // top-p (nucleus) sampling, clamping the least likely tokens to zero
-                    next = sample_topp(state.logits, config.vocab_size, topp, state.probindex);
+                    next = sample_topp(state.logits, config.vocab_size, topp, state.probindex, rnd);
+
+                    int next2 = sample2(state.logits, topp, range_vec, rnd);
+
+                    if (next != next2) {
+                        printf("\nSampling error 2 <%s> <%s>\n", vocab[next].c_str(), vocab[next2].c_str());
+                        exit(EXIT_FAILURE);
+                    }
                 }
             }
         }
