@@ -654,7 +654,7 @@ int main(int argc, char* argv[]) {
         for (int i = 0; i < opt.size(); i += 2) {
             if      (opt[i] == "-t") temperature = stof(opt[i+1]);
             else if (opt[i] == "-p") topp = stof(opt[i+1]);
-            else if (opt[i] == "-s") RNG::seed ^= stoi(opt[i+1]); // xor ensures seed != 0
+            else if (opt[i] == "-s") RNG::seed = stoi(opt[i+1]);
             else if (opt[i] == "-n") steps = stoi(opt[i+1]);
             else if (opt[i] == "-i") prompt = opt[i+1];
             else
