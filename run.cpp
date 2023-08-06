@@ -278,9 +278,9 @@ int argmax(float* probabilities, int n) {
 // have very low probabilities and are less likely to go "off the rails".
 //
 // if topp <= 0 simply sample from the predicted probability distribution
-int sample(float* prob, float topp, const vector<int>& range_vec) {
+int sample(float* prob, float topp, const vector<int>& range) {
 
-    vector v(range_vec); // init with range 0..vocab_size-1
+    vector v(range); // init with range 0..vocab_size-1
     float cumulative_prob = 1.0f;
 
     if (topp > 0) {
@@ -298,7 +298,7 @@ int sample(float* prob, float topp, const vector<int>& range_vec) {
         }
     }
 
-    // sample index from probabilities (they must sum to 1 * cumulative_prob!)
+    // sample index from probabilities (they must sum to 1!)
     float r = RNG::random_f32() * cumulative_prob;
 
     float cdf = 0.0f;
@@ -335,7 +335,7 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
     }
 }
 
-void softmax(float* x, int size) {
+void softmax(float* x, int size, float temperature = 1.0) {
     // find max value (for numerical stability)
     float max_val = x[0];
     for (int i = 1; i < size; i++) {
@@ -343,10 +343,10 @@ void softmax(float* x, int size) {
             max_val = x[i];
         }
     }
-    // exp and sum
+    // exp, sum and apply temperature
     float sum = 0.0f;
     for (int i = 0; i < size; i++) {
-        x[i] = expf(x[i] - max_val);
+        x[i] = expf((x[i] - max_val) / temperature);
         sum += x[i];
     }
     // normalize
@@ -552,8 +552,8 @@ long run_model(int steps, float temperature, float topp, const vector<int>& prom
     printf("<s>\n"); // explicit print the initial BOS token for stylistic symmetry reasons
 
     // fill a helper vector with range 0..vocab_size-1, used in sample
-    vector<int> range_vec(config.vocab_size);
-    for (int i = 0; i < range_vec.size(); i++) { range_vec[i] = i; }
+    vector<int> range(config.vocab_size);
+    for (int i = 0; i < range.size(); i++) { range[i] = i; }
 
     while (pos < steps) {
 
@@ -569,17 +569,14 @@ long run_model(int steps, float temperature, float topp, const vector<int>& prom
                 // greedy argmax sampling: take the token with the highest probability
                 next = argmax(state.logits, config.vocab_size);
             } else {
-                // apply the temperature to the logits
-                for (int q = 0; q < config.vocab_size; q++)
-                    state.logits[q] /= temperature;
+                // apply softmax with temperature to the logits to get the
+                // probabilities for next token.
+                softmax(state.logits, config.vocab_size, temperature);
 
-                // apply softmax to the logits to get the probabilities for next token
-                softmax(state.logits, config.vocab_size);
-
-                // we sample from this distribution to get the next token
+                // sample from this distribution to get the next token
                 // if topp > 0 we perform top-p (nucleus) sampling, clamping the least likely
                 // tokens to zero. Othewise sample from the predicted probability distribution.
-                next = sample(state.logits, topp, range_vec);
+                next = sample(state.logits, topp, range);
             }
         }
         // following BOS token (1), sentencepiece decoder strips any leading whitespace (see PR #89)
