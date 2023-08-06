@@ -110,11 +110,6 @@ struct TransformerWeights {
     void init(MMap&, const Config& p, bool shared_weights);
 };
 
-struct ProbIndex { // used when sorting probabilities during top-p sampling
-    float prob;
-    int index;
-};
-
 struct RunState {
     // Current wave of activations
     float* x;   // activation at current time stamp (dim,)
@@ -127,7 +122,6 @@ struct RunState {
     float* v;   // value (dim,)
     float* att; // buffer for scores/attention values (n_heads, seq_len)
     float* logits; // output logits
-    ProbIndex* probindex; // buffer used in top-p sampling
     // Key and Value cache
     float* key_cache;   // (layer, seq_len, dim)
     float* value_cache; // (layer, seq_len, dim)
@@ -167,7 +161,6 @@ RunState::RunState(const Config& p, const TransformerWeights& w) {
     v   = alloc<float>(p.dim);
     att = alloc<float>(p.n_heads * p.seq_len);
     logits      = alloc<float>(p.vocab_size);
-    probindex   = alloc<ProbIndex>(p.vocab_size);
     key_cache   = alloc<float>(p.n_layers * p.seq_len * p.dim);
     value_cache = alloc<float>(p.n_layers * p.seq_len * p.dim);
 
@@ -285,14 +278,14 @@ int argmax(float* probabilities, int n) {
 // have very low probabilities and are less likely to go "off the rails".
 //
 // if topp <= 0 simply sample from the predicted probability distribution
-int sample2(float* prob, float topp, const vector<int>& range_vec, float rnd) {
+int sample(float* prob, float topp, const vector<int>& range_vec) {
 
-    vector v(range_vec); // init with 1..vocab_size range
+    vector v(range_vec); // init with range 0..vocab_size-1
     float cumulative_prob = 1.0f;
 
     if (topp > 0) {
         // sort v in descending order of indexed probabilities
-        std::sort(v.begin(), v.end(), [&prob](int i1, int i2) { return prob[i1] > prob[i2]; });
+        sort(v.begin(), v.end(), [&prob](int i1, int i2) { return prob[i1] > prob[i2]; });
 
         // truncate the list where cumulative probability exceeds topp
         cumulative_prob = 0.0f;
@@ -300,81 +293,22 @@ int sample2(float* prob, float topp, const vector<int>& range_vec, float rnd) {
             cumulative_prob += prob[v[i]];
             if (cumulative_prob > topp) {
                 v.resize(i+1);
-                break; // we've exceeded topp by including last_idx
+                break; // we've exceeded topp by including this last item
             }
         }
     }
 
     // sample index from probabilities (they must sum to 1 * cumulative_prob!)
-    //float r = RNG::random_f32() * cumulative_prob;
-    float r = rnd * cumulative_prob; // Debug!!
+    float r = RNG::random_f32() * cumulative_prob;
 
     float cdf = 0.0f;
     for (size_t i = 0; i < v.size(); i++) {
         cdf += prob[v[i]];
-        if (r < cdf) {
+        if (r < cdf)
             return v[i];
-        }
     }
 
     return v.back(); // in case of rounding errors
-}
-
-int sample(float* probabilities, int n, float rnd) {
-    // sample index from probabilities (they must sum to 1!)
-    float r = rnd; // RNG::random_f32();
-    float cdf = 0.0f;
-    for (int i = 0; i < n; i++) {
-        cdf += probabilities[i];
-        if (r < cdf) {
-            return i;
-        }
-    }
-    return n - 1; // in case of rounding errors
-}
-
-int compare(const void* a, const void* b) {
-    ProbIndex* a_ = (ProbIndex*) a;
-    ProbIndex* b_ = (ProbIndex*) b;
-    if (a_->prob > b_->prob) return -1;
-    if (a_->prob < b_->prob) return 1;
-    return 0;
-}
-
-int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, float rnd) {
-    // top-p sampling (or "nucleus sampling") samples from the smallest set of
-    // tokens that exceed probability topp. This way we never sample tokens that
-    // have very low probabilities and are less likely to go "off the rails".
-
-    // quicksort indices in descending order of probabilities
-    for (int i = 0; i < n; i++) {
-        probindex[i].index = i;
-        probindex[i].prob = probabilities[i];
-    }
-    qsort(probindex, n, sizeof(ProbIndex), compare);
-
-    // truncate the list where cumulative probability exceeds topp
-    float cumulative_prob = 0.0f;
-    int last_idx = 0;
-    for (int i = 0; i < n; i++) {
-        cumulative_prob += probindex[i].prob;
-        if (cumulative_prob > topp) {
-            last_idx = i;
-            break; // we've exceeded topp by including last_idx
-        }
-    }
-
-    // sample from the truncated list
-    //float r = RNG::random_f32() * cumulative_prob;
-    float r = rnd * cumulative_prob;
-    float cdf = 0.0f;
-    for (int i = 0; i <= last_idx; i++) {
-        cdf += probindex[i].prob;
-        if (r < cdf) {
-            return probindex[i].index;
-        }
-    }
-    return probindex[last_idx].index; // in case of rounding errors
 }
 
 // ----------------------------------------------------------------------------
@@ -617,6 +551,7 @@ long run_model(int steps, float temperature, float topp, const vector<int>& prom
 
     printf("<s>\n"); // explicit print the initial BOS token for stylistic symmetry reasons
 
+    // fill a helper vector with range 0..vocab_size-1, used in sample
     vector<int> range_vec(config.vocab_size);
     for (int i = 0; i < range_vec.size(); i++) { range_vec[i] = i; }
 
@@ -641,30 +576,10 @@ long run_model(int steps, float temperature, float topp, const vector<int>& prom
                 // apply softmax to the logits to get the probabilities for next token
                 softmax(state.logits, config.vocab_size);
 
-                float rnd = RNG::random_f32();
-
                 // we sample from this distribution to get the next token
-                if (topp <= 0) {
-                    // simply sample from the predicted probability distribution
-                    next = sample(state.logits, config.vocab_size, rnd);
-
-                    int next2 = sample2(state.logits, topp, range_vec, rnd);
-
-                    if (next != next2) {
-                        printf("\nSampling error 1 <%s> <%s>\n", vocab[next].c_str(), vocab[next2].c_str());
-                        exit(EXIT_FAILURE);
-                    }
-                } else {
-                    // top-p (nucleus) sampling, clamping the least likely tokens to zero
-                    next = sample_topp(state.logits, config.vocab_size, topp, state.probindex, rnd);
-
-                    int next2 = sample2(state.logits, topp, range_vec, rnd);
-
-                    if (next != next2) {
-                        printf("\nSampling error 2 <%s> <%s>\n", vocab[next].c_str(), vocab[next2].c_str());
-                        exit(EXIT_FAILURE);
-                    }
-                }
+                // if topp > 0 we perform top-p (nucleus) sampling, clamping the least likely
+                // tokens to zero. Othewise sample from the predicted probability distribution.
+                next = sample(state.logits, topp, range_vec);
             }
         }
         // following BOS token (1), sentencepiece decoder strips any leading whitespace (see PR #89)
