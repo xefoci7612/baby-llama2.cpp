@@ -541,7 +541,7 @@ void bpe_encode(vector<int>* tokens_ptr, const char* text, const vector<string>&
 // ----------------------------------------------------------------------------
 // main loop, runs model inference
 
-long run_model(int steps, float temperature, float topp, const vector<int>& prompt_tokens, RunState& state,
+long run_model(int* steps, float temperature, float topp, const vector<int>& prompt_tokens, RunState& state,
                Config& config, TransformerWeights& weights, const vector<string>& vocab) {
 
     long start = 0;  // used to time our code, only initialized after first iteration
@@ -549,17 +549,16 @@ long run_model(int steps, float temperature, float topp, const vector<int>& prom
     int token = 1;   // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
     int pos = 0;     // position in the sequence
 
-    printf("<s>\n"); // explicit print the initial BOS token for stylistic symmetry reasons
-
     // fill a helper vector with range 0..vocab_size-1, used in sample
     vector<int> range(config.vocab_size);
     for (int i = 0; i < range.size(); i++) { range[i] = i; }
 
-    while (pos < steps) {
+    while (pos < *steps) {
 
         // forward the transformer to get logits for the next token
         transformer(token, pos, &config, &state, &weights);
 
+        // advance the state machine
         if (pos < prompt_tokens.size()) {
             // if we are still processing the input prompt, force the next prompt token
             next = prompt_tokens[pos];
@@ -579,22 +578,26 @@ long run_model(int steps, float temperature, float topp, const vector<int>& prom
                 next = sample(state.logits, topp, range);
             }
         }
-        // following BOS token (1), sentencepiece decoder strips any leading whitespace (see PR #89)
+
+        pos++; // before a possible break due to BOS
+
+        // data-dependent terminating condition: the BOS (1) token delimits sequences
+        if (next == 1)
+            break;
+
+        // following BOS (1) token, sentencepiece decoder strips any leading whitespace (see PR #89)
         string token_str = vocab[next];
         if (token == 1 && token_str[0] == ' ')
             token_str.erase(0, 1);
-
         cout << token_str << std::flush;
-
-        // advance forward
         token = next;
-        pos++;
 
-        // init our timer here because the first iteration is slow due to memmap
+        // init the timer here because the first iteration can be slower
         if (start == 0)
             start = time_in_ms();
     }
-
+    cout << endl;
+    *steps = pos;
     return time_in_ms() - start; // elapsed time in ms
 }
 
@@ -662,11 +665,12 @@ int main(int argc, char* argv[]) {
     if (steps <= 0 || steps > config.seq_len)
         steps = config.seq_len;
 
-    // Run the model for the given number of steps
-    long elapsed = run_model(steps, temperature, topp, prompt_tokens, state, config, weights, vocab);
+    // Run the model for the given number of steps or until BOS token
+    long elapsed = run_model(&steps, temperature, topp, prompt_tokens, state, config, weights, vocab);
 
-    // Report achieved tok/s
-    fprintf(stderr, "\nachieved tok/s: %f\n", (steps-1) / (double)(elapsed)*1000);
+    // report achieved tok/s (steps-1 because the timer starts after first iteration)
+    if (steps > 1)
+        fprintf(stderr, "\nachieved tok/s: %f\n", (steps-1) / (double)(elapsed)*1000);
 
     return 0;
 }
