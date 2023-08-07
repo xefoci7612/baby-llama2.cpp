@@ -121,7 +121,7 @@ struct RunState {
     float* k;   // key (dim,)
     float* v;   // value (dim,)
     float* att; // buffer for scores/attention values (n_heads, seq_len)
-    float* logits; // output logits
+    float* logits; // output logits (vocab_size)
     // Key and Value cache
     float* key_cache;   // (layer, seq_len, dim)
     float* value_cache; // (layer, seq_len, dim)
@@ -314,13 +314,13 @@ int sample(float* prob, float topp, const vector<int>& range) {
 // ----------------------------------------------------------------------------
 // neural net blocks
 
-void accum(float *a, float *b, int size) {
+void accum(float* a, float* b, int size) {
     for (int i = 0; i < size; i++) {
         a[i] += b[i];
     }
 }
 
-void rmsnorm(float* o, float* x, float* weight, int size) {
+void rmsnorm(float* o, float* x, float* w, int size) {
     // calculate sum of squares
     float ss = 0.0f;
     for (int j = 0; j < size; j++) {
@@ -331,7 +331,7 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
     ss = 1.0f / sqrtf(ss);
     // normalize and scale
     for (int j = 0; j < size; j++) {
-        o[j] = weight[j] * (ss * x[j]);
+        o[j] = w[j] * (ss * x[j]);
     }
 }
 
@@ -372,37 +372,39 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
 void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights* w) {
 
     // a few convenience variables
-    float *x = s->x;
+    float* x = s->x;
     size_t dim = p->dim;
     size_t hidden_dim =  p->hidden_dim;
     size_t head_size = dim / p->n_heads;
 
     // copy the token embedding into x
-    float* content_row = &(w->token_embedding_table[token * dim]);
-    memcpy(x, content_row, dim*sizeof(*x));
+    float* content_row = w->token_embedding_table + token * dim;
+    memcpy(x, content_row, dim * sizeof(float));
 
     // pluck out the "pos" row of freq_cis
     complex<float>* freq_cis_row = s->freq_cis + pos * head_size / 2;
 
     // forward all the layers
-    for (int l = 0; l < p->n_layers; l++) {
+    for (size_t l = 0; l < p->n_layers; l++) {
 
-        // attention rmsnorm
-        rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
+        // attention rmsnorm (Root Mean Square normalization)
+        rmsnorm(s->xb, x, w->rms_att_weight + l * dim, dim);
 
-        // qkv matmuls for this position
+        // qkv matmuls for this position (V X M = V)
         matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
         matmul(s->k, s->xb, w->wk + l*dim*dim, dim, dim);
         matmul(s->v, s->xb, w->wv + l*dim*dim, dim, dim);
 
-        // apply RoPE rotation to the q and k vectors for each head
+        // apply RoPE rotation to the q and k vectors for each head,
+        // loop across dim = p->n_heads * head_size
+        // Rotation vector freq_cis is the same for each head
         int h;
         #pragma omp parallel for private(h)
         for (h = 0; h < p->n_heads; h++) {
             // get the q and k complex vectors for this head
             complex<float>* q_c = (complex<float>*)(s->q + h * head_size);
             complex<float>* k_c = (complex<float>*)(s->k + h * head_size);
-            // rotate q and k by the freq_cis_real and freq_cis_imag
+            // rotate q and k by the complex freq_cis
             for (int i = 0; i < head_size / 2; i++) {
                 q_c[i] *= freq_cis_row[i];
                 k_c[i] *= freq_cis_row[i];
@@ -413,8 +415,8 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         size_t loff = l * p->seq_len * dim; // kv cache layer offset for convenience
         float* key_cache_row = s->key_cache + loff + pos * dim;
         float* value_cache_row = s->value_cache + loff + pos * dim;
-        memcpy(key_cache_row, s->k, dim*sizeof(*key_cache_row));
-        memcpy(value_cache_row, s->v, dim*sizeof(*value_cache_row));
+        memcpy(key_cache_row, s->k, dim * sizeof(float));
+        memcpy(value_cache_row, s->v, dim * sizeof(float));
 
         // multihead attention. iterate over all heads
         #pragma omp parallel for private(h)
@@ -456,18 +458,18 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         }
 
         // final matmul to get the output of the attention
-        matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+        matmul(s->xb2, s->xb, w->wo + l * dim * dim, dim, dim);
 
         // residual connection back into x
         accum(x, s->xb2, dim);
 
         // ffn rmsnorm
-        rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+        rmsnorm(s->xb, x, w->rms_ffn_weight + l * dim, dim);
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
-        matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
-        matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+        matmul(s->hb, s->xb, w->w1 + l * dim * hidden_dim, dim, hidden_dim);
+        matmul(s->hb2, s->xb, w->w3 + l * dim * hidden_dim, dim, hidden_dim);
 
         // F.silu; silu(x)=x*σ(x),where σ(x) is the logistic sigmoid
         for (int i = 0; i < hidden_dim; i++) {
@@ -480,7 +482,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         }
 
         // final matmul to get the output of the ffn
-        matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
+        matmul(s->xb, s->hb, w->w2 + l * dim * hidden_dim, hidden_dim, dim);
 
         // residual connection
         accum(x, s->xb, dim);
@@ -544,10 +546,10 @@ void bpe_encode(vector<int>* tokens_ptr, const char* text, const vector<string>&
 long run_model(int* steps, float temperature, float topp, const vector<int>& prompt_tokens, RunState& state,
                Config& config, TransformerWeights& weights, const vector<string>& vocab) {
 
-    long start = 0;  // used to time our code, only initialized after first iteration
-    int next;        // will store the next token in the sequence
-    int token = 1;   // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
-    int pos = 0;     // position in the sequence
+    long start = 0; // used to time our code, only initialized after first iteration
+    int next;       // will store the next token in the sequence
+    int token = 1;  // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
+    int pos = 0;    // position in the sequence
 
     // fill a helper vector with range 0..vocab_size-1, used in sample
     vector<int> range(config.vocab_size);
@@ -601,6 +603,18 @@ long run_model(int* steps, float temperature, float topp, const vector<int>& pro
     return time_in_ms() - start; // elapsed time in ms
 }
 
+void print_model_info(const Config& config, vector<string>& vocab) {
+    cerr << "\nModel parameters:\n"
+         << "\n    Vocab size " << vocab.size()
+         << "\n    Dimension " << config.dim
+         << "\n    Hidden dim " << config.dim
+         << "\n    Num heads " << config.n_heads
+         << "\n    Head size (dim / num heads) " << config.dim / config.n_heads
+         << "\n    Num layers " << config.n_layers
+         << "\n    Max context (tokens) " << config.seq_len
+         << "\n" << endl;
+}
+
 void error_usage() {
     cerr << "Usage:   run <checkpoint> [options]\n"
             "Example: run model.bin -n 256 -i \"Once upon a time\"\n"
@@ -652,6 +666,8 @@ int main(int argc, char* argv[]) {
     // Memory map the checkpoint file and init weights
     MMap mmap(checkpoint);
     init_from_mmap(mmap, &config, &weights, &vocab);
+
+    print_model_info(config, vocab);
 
     // Create and init the application RunState
     RunState state(config, weights);
