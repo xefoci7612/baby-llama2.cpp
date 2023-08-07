@@ -395,69 +395,21 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         matmul(s->k, s->xb, w->wk + l*dim*dim, dim, dim);
         matmul(s->v, s->xb, w->wv + l*dim*dim, dim, dim);
 
-        // apply RoPE rotation to the q and k vectors for each head,
-        // loop across dim = p->n_heads * head_size
-        // Rotation vector freq_cis is the same for each head
-        int h;
-        //#pragma omp parallel for private(h)
-        for (h = 0; h < p->n_heads; h++) {
-            // get the q and k complex vectors for this head
-            complex<float>* q_c = (complex<float>*)(s->q + h * head_size);
-            complex<float>* k_c = (complex<float>*)(s->k + h * head_size);
-            // rotate q and k by the complex freq_cis
-
-            /*
-            size_t cz = sizeof(complex<float>);
-            size_t fz = sizeof(float);
-            size_t addr1 = &q_c[0] - (complex<float>*)(s->q);
-            size_t addr2 = &q_c[head_size / 2] - (complex<float>*)(s->q);
-            cout << addr1 * cz << " - " << addr2 * cz << endl;
-
-            size_t addr3 = (s->q + h * head_size) - s->q;
-            size_t addr4 = (s->q + h * head_size + head_size)- s->q;
-            cout << addr3 * fz << " - " << addr4 * fz << endl << endl;
-            */
-
-            for (int i = 0; i < head_size / 2; i++) {
-                q_c[i] *= freq_cis_row[i];
-                k_c[i] *= freq_cis_row[i];
-
-                //complex<float>* p = &freq_cis_row[i];
-                cout << q_c[i] << " ";
-            }
-        }
-
-        cout << endl << endl;
-
+        // interpret q and k as complex vectors where two
+        // consecutive elements are assumed to be the real
+        // and img part of a complex number.
+        // Rotation is easier in this way
         complex<float>* q_c = (complex<float>*)(s->q);
         complex<float>* k_c = (complex<float>*)(s->k);
 
-       for (h = 0; h < p->n_heads * head_size / 2; h ++) {
-            // get the q and k complex vectors for this head
-
-            // rotate q and k by the complex freq_cis
-
-            /*
-            size_t cz = sizeof(complex<float>);
-            size_t fz = sizeof(float);
-            size_t addr1 = &q_c[0] - (complex<float>*)(s->q);
-            size_t addr2 = &q_c[head_size / 2] - (complex<float>*)(s->q);
-            cout << addr1 * cz << " - " << addr2 * cz << endl;
-
-            size_t addr3 = (s->q + h * head_size) - s->q;
-            size_t addr4 = (s->q + h * head_size + head_size)- s->q;
-            cout << addr3 * fz << " - " << addr4 * fz << endl << endl;
-            */
-
-
-                q_c[h] *= freq_cis_row[h % (head_size / 2)];
-                k_c[h] *= freq_cis_row[h % (head_size / 2)];
-
-                //complex<float>* p = &freq_cis_row[h % (head_size / 2)];
-                cout << q_c[h] << " " << std::flush;
+        // apply RoPE rotation to q_c and k_c, rotation vector
+        // freq_cis_row is the same for all heads
+        int h;
+        #pragma omp parallel for private(h)
+        for (h = 0; h < p->n_heads * head_size / 2; h++) {
+            q_c[h] *= freq_cis_row[h % (head_size / 2)];
+            k_c[h] *= freq_cis_row[h % (head_size / 2)];
         }
-
-        exit(1);
 
         // save key,value at this time step (pos) to our kv cache
         size_t loff = l * p->seq_len * dim; // kv cache layer offset for convenience
