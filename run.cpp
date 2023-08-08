@@ -22,7 +22,6 @@ $ ./run
 #endif
 
 #include <algorithm>
-#include <complex>
 #include <iostream>
 #include <vector>
 #include <sys/stat.h>
@@ -125,9 +124,6 @@ struct RunState {
     // Key and Value cache
     float* key_cache;   // (layer, seq_len, dim)
     float* value_cache; // (layer, seq_len, dim)
-    // Helper complex vector for RoPE
-    complex<float>* freq_cis; // (seq_len, head_size / 2)
-
     // Poor's man memory management
     void* mem_vec[20] = { NULL };
     int len = 0;
@@ -163,12 +159,6 @@ RunState::RunState(const Config& p, const TransformerWeights& w) {
     logits      = alloc<float>(p.vocab_size);
     key_cache   = alloc<float>(p.n_layers * p.seq_len * p.dim);
     value_cache = alloc<float>(p.n_layers * p.seq_len * p.dim);
-
-    freq_cis = alloc<complex<float>>(p.seq_len * head_size / 2);
-
-    // Copy the 2 loaded RoPE vectors into a single complex vector
-    for (size_t i = 0; i < p.seq_len * head_size / 2; i++)
-        freq_cis[i] = complex<float>(w.freq_cis_real[i], w.freq_cis_imag[i]);
 }
 
 void TransformerWeights::init(MMap& m, const Config& p, bool shared_weights) {
@@ -369,6 +359,13 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
     }
 }
 
+void complexmul(float* a, float* b, float c, float d) {
+    // (a+ib)(c+id) -> (ac-bd) + i(ad+bd)
+    float a0 = *a;
+    *a = *a * c - *b * d;
+    *b = a0 * d + *b * c;
+}
+
 void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights* w) {
 
     // a few convenience variables
@@ -381,8 +378,9 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     float* content_row = w->token_embedding_table + token * dim;
     memcpy(x, content_row, dim * sizeof(float));
 
-    // pluck out the "pos" row of freq_cis
-    complex<float>* freq_cis_row = s->freq_cis + pos * head_size / 2;
+    // pluck out the "pos" row of freq_cis_real and freq_cis_imag
+    float* fr = w->freq_cis_real + pos * head_size / 2;
+    float* fi = w->freq_cis_imag + pos * head_size / 2;
 
     // forward all the layers
     for (size_t l = 0; l < p->n_layers; l++) {
@@ -391,24 +389,18 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         rmsnorm(s->xb, x, w->rms_att_weight + l * dim, dim);
 
         // qkv matmuls for this position (V X M = V)
-        matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
-        matmul(s->k, s->xb, w->wk + l*dim*dim, dim, dim);
-        matmul(s->v, s->xb, w->wv + l*dim*dim, dim, dim);
+        matmul(s->q, s->xb, w->wq + l * dim * dim, dim, dim);
+        matmul(s->k, s->xb, w->wk + l * dim * dim, dim, dim);
+        matmul(s->v, s->xb, w->wv + l * dim * dim, dim, dim);
 
-        // interpret q and k as complex vectors where two
-        // consecutive elements are assumed to be the real
-        // and img part of a complex number.
-        // Rotation is easier in this way
-        complex<float>* q_c = (complex<float>*)(s->q);
-        complex<float>* k_c = (complex<float>*)(s->k);
-
-        // apply RoPE rotation to q_c and k_c, rotation vector
-        // freq_cis_row is the same for all heads
+        // RoPE relative positional encoding: complex-valued
+        // rotate q and k by freq_cis in each head.
         int h;
         #pragma omp parallel for private(h)
-        for (h = 0; h < p->n_heads * head_size / 2; h++) {
-            q_c[h] *= freq_cis_row[h % (head_size / 2)];
-            k_c[h] *= freq_cis_row[h % (head_size / 2)];
+        for (h = 0; h < dim; h += 2) {
+            int k = (h % head_size) / 2;
+            complexmul(s->q + h, s->q + h + 1, fr[k], fi[k]);
+            complexmul(s->k + h, s->k + h + 1, fr[k], fi[k]);
         }
 
         // save key,value at this time step (pos) to our kv cache
@@ -434,6 +426,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
                 for (int i = 0; i < head_size; i++) {
                     score += q[i] * k[i];
                 }
+                // scale down attention score before softmax
                 score /= sqrtf(head_size);
                 // save the score to the attention buffer
                 att[t] = score;
