@@ -101,8 +101,8 @@ struct TransformerWeights {
     // final rmsnorm
     float* rms_final_weight; // (dim,)
     // freq_cis for RoPE relatively positional embeddings
-    float* freq_cis_real; // (seq_len, head_size / 2)
-    float* freq_cis_imag; // (seq_len, head_size / 2)
+    // (not used) freq_cis_real (seq_len, head_size / 2)
+    // (not used) freq_cis_imag (seq_len, head_size / 2)
     // (optional) classifier weights for the logits, on the last layer
     float* wcls;
 
@@ -124,6 +124,10 @@ struct RunState {
     // Key and Value cache
     float* key_cache;   // (layer, seq_len, dim)
     float* value_cache; // (layer, seq_len, dim)
+    // freq_cis for RoPE relatively positional embeddings
+    float* freq_cis_real; // (seq_len, head_size / 2)
+    float* freq_cis_imag; // (seq_len, head_size / 2)
+
     // Poor's man memory management
     void* mem_vec[20] = { NULL };
     int len = 0;
@@ -159,6 +163,19 @@ RunState::RunState(const Config& p, const TransformerWeights& w) {
     logits      = alloc<float>(p.vocab_size);
     key_cache   = alloc<float>(p.n_layers * p.seq_len * p.dim);
     value_cache = alloc<float>(p.n_layers * p.seq_len * p.dim);
+    freq_cis_real = alloc<float>(p.seq_len * head_size / 2);
+    freq_cis_imag = alloc<float>(p.seq_len * head_size / 2);
+
+    // Compute freq_cis tables
+    float theta = 1e+08;
+    for (int pos = 0; pos < p.seq_len; pos++) {
+        for (int i = 0; i < head_size / 2; i++) {
+            float freq = 1.0 / pow(theta, float(i) / head_size);
+            freq *= pos;
+            freq_cis_real[pos * head_size / 2 + i] = cos(freq);
+            freq_cis_imag[pos * head_size / 2 + i] = sin(freq);
+        }
+    }
 }
 
 void TransformerWeights::init(MMap& m, const Config& p, bool shared_weights) {
@@ -176,8 +193,9 @@ void TransformerWeights::init(MMap& m, const Config& p, bool shared_weights) {
     w2                    = m.get_ptr<float>(p.n_layers * p.dim * p.hidden_dim);
     w3                    = m.get_ptr<float>(p.n_layers * p.dim * p.hidden_dim);
     rms_final_weight      = m.get_ptr<float>(p.dim);
-    freq_cis_real         = m.get_ptr<float>(p.seq_len * head_size / 2);
-    freq_cis_imag         = m.get_ptr<float>(p.seq_len * head_size / 2);
+
+    /* freq_cis_real */ m.get_ptr<float>(p.seq_len * head_size / 2);
+    /* freq_cis_imag */ m.get_ptr<float>(p.seq_len * head_size / 2);
 
     wcls = shared_weights ? token_embedding_table : m.get_ptr<float>(1);
 }
@@ -379,8 +397,8 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     memcpy(x, content_row, dim * sizeof(float));
 
     // pluck out the "pos" row of freq_cis_real and freq_cis_imag
-    float* fr = w->freq_cis_real + pos * head_size / 2;
-    float* fi = w->freq_cis_imag + pos * head_size / 2;
+    float* fr = s->freq_cis_real + pos * head_size / 2;
+    float* fi = s->freq_cis_imag + pos * head_size / 2;
 
     // forward all the layers
     for (size_t l = 0; l < p->n_layers; l++) {
