@@ -21,7 +21,7 @@ $ ./run
     #include <sys/mman.h>
 #endif
 
-#include <algorithm>
+#include <algorithm> // std::sort
 #include <iostream>
 #include <vector>
 #include <sys/stat.h>
@@ -29,9 +29,14 @@ $ ./run
 using namespace std;
 
 // ----------------------------------------------------------------------------
-// Memory mapping facility to load model file
+// Memory mapping facility to load model and tokenizer files
 
 class MMap {
+
+    size_t size;
+    void* data;
+    char* cur; // pointer arithmetic on void* is not standard
+
 public:
     MMap(const char* file) {
         struct stat fileInfo;
@@ -40,18 +45,18 @@ public:
             fprintf(stderr, "Couldn't open file %s\n", file);
             exit(EXIT_FAILURE);
         }
-        size = fileInfo.st_size;
         data = mmap(NULL, fileInfo.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
         if (data == MAP_FAILED) {
             fprintf(stderr, "mmap failed!\n");
             exit(EXIT_FAILURE);
         }
         cur = static_cast<char*>(data);
+        size = fileInfo.st_size;
         close(fd); // we can close the file once mapped
     }
     ~MMap() { munmap(data, size); }
 
-    template<typename T>
+    template<typename T = float>
     T* get_ptr(size_t len) {
         T* ptr = reinterpret_cast<T*>(cur);
         cur += len * sizeof(T);
@@ -63,31 +68,26 @@ public:
         rhs = *this->get_ptr<T>(1);
         return *this;
     }
-
-private:
-    size_t size;
-    void* data;
-    char* cur; // pointer arithmetic on void* is not standard
 };
 
 // ----------------------------------------------------------------------------
 // Transformer and RunState structs, and related initializations
 
 struct Config {
-    size_t dim; // transformer dimension
+    size_t dim;        // transformer dimension
     size_t hidden_dim; // for ffn layers
-    size_t n_layers; // number of layers
-    size_t n_heads; // number of query heads
+    size_t n_layers;   // number of layers
+    size_t n_heads;    // number of query heads
     size_t n_kv_heads; // number of key/value heads (can be < query heads because of multiquery)
     size_t vocab_size; // vocabulary size, usually 256 (byte-level)
-    size_t seq_len; // max sequence length
+    size_t seq_len;    // max sequence length
 };
 
 struct TransformerWeights {
     // token embedding table
     float* token_embedding_table; // (vocab_size, dim)
     // weights for rmsnorms
-    float* rms_att_weight; // (layer, dim) rmsnorm weights
+    float* rms_att_weight; // (layer, dim)
     float* rms_ffn_weight; // (layer, dim)
     // weights for matmuls
     float* wq; // (layer, dim, dim)
@@ -101,12 +101,12 @@ struct TransformerWeights {
     // final rmsnorm
     float* rms_final_weight; // (dim,)
     // freq_cis for RoPE relatively positional embeddings
-    // (not used) freq_cis_real (seq_len, head_size / 2)
-    // (not used) freq_cis_imag (seq_len, head_size / 2)
+    // freq_cis_real (seq_len, head_size / 2) we don't use it
+    // freq_cis_imag (seq_len, head_size / 2) we don't use it
     // (optional) classifier weights for the logits, on the last layer
     float* wcls;
 
-    void init(MMap&, const Config& p, bool shared_weights);
+    void init(MMap&, Config* p, bool shared_weights);
 };
 
 struct RunState {
@@ -128,43 +128,41 @@ struct RunState {
     float* freq_cis; // (seq_len, head_size)
 
     // Poor's man memory management
-    void* mem_vec[20] = { NULL };
-    int len = 0;
+    vector<void*> allocs;
 
-    template<typename T>
-    T* alloc(size_t n) {
+    float* alloc(size_t n) {
         // We calloc instead of malloc to keep valgrind happy
-        mem_vec[len] = calloc(n, sizeof(T));
-        if (!mem_vec[len]) {
+        allocs.push_back(calloc(n, sizeof(float)));
+        if (!allocs.back()) {
             fprintf(stderr, "Cannot allocate run state!\n");
             exit(EXIT_FAILURE);
         }
-        return static_cast<T*>(mem_vec[len++]);
+        return static_cast<float*>(allocs.back());
     }
 
     RunState(const Config&, const TransformerWeights&);
-   ~RunState() { for (int i = 0; i < len; i++) free(mem_vec[i]); }
+   ~RunState() { for (void* d : allocs) free(d); }
 };
 
 RunState::RunState(const Config& p, const TransformerWeights& w) {
 
     size_t head_size = p.dim / p.n_heads;
 
-    x   = alloc<float>(p.dim);
-    xb  = alloc<float>(p.dim);
-    xb2 = alloc<float>(p.dim);
-    hb  = alloc<float>(p.hidden_dim);
-    hb2 = alloc<float>(p.hidden_dim);
-    q   = alloc<float>(p.dim);
-    k   = alloc<float>(p.dim);
-    v   = alloc<float>(p.dim);
-    att = alloc<float>(p.n_heads * p.seq_len);
-    logits      = alloc<float>(p.vocab_size);
-    key_cache   = alloc<float>(p.n_layers * p.seq_len * p.dim);
-    value_cache = alloc<float>(p.n_layers * p.seq_len * p.dim);
-    freq_cis    = alloc<float>(p.seq_len * head_size);
+    x   = alloc(p.dim);
+    xb  = alloc(p.dim);
+    xb2 = alloc(p.dim);
+    hb  = alloc(p.hidden_dim);
+    hb2 = alloc(p.hidden_dim);
+    q   = alloc(p.dim);
+    k   = alloc(p.dim);
+    v   = alloc(p.dim);
+    att = alloc(p.n_heads * p.seq_len);
+    logits      = alloc(p.vocab_size);
+    key_cache   = alloc(p.n_layers * p.seq_len * p.dim);
+    value_cache = alloc(p.n_layers * p.seq_len * p.dim);
+    freq_cis    = alloc(p.seq_len * head_size);
 
-    // Compute freq_cis table
+    // Compute freq_cis table, don't load from model.bin
     float theta = 1e+08;
     float* ptr = freq_cis;
     for (int pos = 0; pos < p.seq_len; pos++) {
@@ -177,25 +175,25 @@ RunState::RunState(const Config& p, const TransformerWeights& w) {
     }
 }
 
-void TransformerWeights::init(MMap& m, const Config& p, bool shared_weights) {
+void TransformerWeights::init(MMap& m, Config* p, bool shared_weights) {
 
-    size_t head_size = p.dim / p.n_heads;
+    size_t head_size = p->dim / p->n_heads;
 
-    token_embedding_table = m.get_ptr<float>(p.vocab_size * p.dim);
-    rms_att_weight        = m.get_ptr<float>(p.n_layers * p.dim);
-    wq                    = m.get_ptr<float>(p.n_layers * p.dim * p.dim);
-    wk                    = m.get_ptr<float>(p.n_layers * p.dim * p.dim);
-    wv                    = m.get_ptr<float>(p.n_layers * p.dim * p.dim);
-    wo                    = m.get_ptr<float>(p.n_layers * p.dim * p.dim);
-    rms_ffn_weight        = m.get_ptr<float>(p.n_layers * p.dim);
-    w1                    = m.get_ptr<float>(p.n_layers * p.dim * p.hidden_dim);
-    w2                    = m.get_ptr<float>(p.n_layers * p.dim * p.hidden_dim);
-    w3                    = m.get_ptr<float>(p.n_layers * p.dim * p.hidden_dim);
-    rms_final_weight      = m.get_ptr<float>(p.dim);
-    /* freq_cis_real */     m.get_ptr<float>(p.seq_len * head_size / 2);
-    /* freq_cis_imag */     m.get_ptr<float>(p.seq_len * head_size / 2);
+    token_embedding_table = m.get_ptr(p->vocab_size * p->dim);
+    rms_att_weight        = m.get_ptr(p->n_layers * p->dim);
+    wq                    = m.get_ptr(p->n_layers * p->dim * p->dim);
+    wk                    = m.get_ptr(p->n_layers * p->dim * p->dim);
+    wv                    = m.get_ptr(p->n_layers * p->dim * p->dim);
+    wo                    = m.get_ptr(p->n_layers * p->dim * p->dim);
+    rms_ffn_weight        = m.get_ptr(p->n_layers * p->dim);
+    w1                    = m.get_ptr(p->n_layers * p->dim * p->hidden_dim);
+    w2                    = m.get_ptr(p->n_layers * p->dim * p->hidden_dim);
+    w3                    = m.get_ptr(p->n_layers * p->dim * p->hidden_dim);
+    rms_final_weight      = m.get_ptr(p->dim);
+ /* freq_cis_real */        m.get_ptr(p->seq_len * head_size / 2);
+ /* freq_cis_imag */        m.get_ptr(p->seq_len * head_size / 2);
 
-    wcls = shared_weights ? token_embedding_table : m.get_ptr<float>(1);
+    wcls = shared_weights ? token_embedding_table : m.get_ptr(1);
 }
 
 void init_from_mmap(MMap& m, Config* config, TransformerWeights* weights, vector<string>* vocab) {
@@ -224,9 +222,9 @@ void init_from_mmap(MMap& m, Config* config, TransformerWeights* weights, vector
     config->vocab_size = abs(x);
 
     // Memory map the Transformer weights into the data pointer
-    weights->init(m, *config, shared_weights);
+    weights->init(m, config, shared_weights);
 
-    // Read in the tokenizer.bin file
+    // Read in tokenizer.bin
     MMap t("tokenizer.bin");
     t >> x; // ignore max_token_length
 
@@ -258,6 +256,7 @@ namespace RNG {
         seed ^= seed >> 27;
         return (seed * 0x2545F4914F6CDD1Dull) >> 32;
     }
+
     float random_f32() { // random float32 in [0,1)
         return (random_u32() >> 8) / 16777216.0f;
     }
@@ -266,17 +265,9 @@ namespace RNG {
 // ----------------------------------------------------------------------------
 // sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
 
-int argmax(float* probabilities, int n) {
+int argmax(float* prob, int n) {
     // return the index that has the highest probability
-    int max_i = 0;
-    float max_p = probabilities[0];
-    for (int i = 1; i < n; i++) {
-        if (probabilities[i] > max_p) {
-            max_i = i;
-            max_p = probabilities[i];
-        }
-    }
-    return max_i;
+    return std::distance(prob, max_element(prob, prob + n));
 }
 
 // top-p sampling (or "nucleus sampling") samples from the smallest set of
@@ -343,12 +334,9 @@ void rmsnorm(float* o, float* x, float* w, int size) {
 
 void softmax(float* x, int size, float temperature = 1.0) {
     // find max value (for numerical stability)
-    float max_val = x[0];
-    for (int i = 1; i < size; i++) {
-        if (x[i] > max_val) {
-            max_val = x[i];
-        }
-    }
+    int id = argmax(x, size);
+    float max_val = x[id];
+
     // exp, sum and apply temperature
     float sum = 0.0f;
     for (int i = 0; i < size; i++) {
@@ -414,8 +402,8 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         #pragma omp parallel for private(h)
         for (h = 0; h < dim; h += 2) {
             int k = h % head_size;
-            complexmul(s->q + h, s->q + h + 1, fr[k], fr[k+1]);
-            complexmul(s->k + h, s->k + h + 1, fr[k], fr[k+1]);
+            complexmul(s->q+h, s->q+h+1, fr[k], fr[k+1]);
+            complexmul(s->k+h, s->k+h+1, fr[k], fr[k+1]);
         }
 
         // save key,value at this time step (pos) to our kv cache
@@ -507,25 +495,24 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 // byte pair encoding (BPE) tokenizer, encodes strings into tokens so we can prompt
 
 int str_lookup(const string& str, const vector<string>& vocab) {
-    for (int i = 0; i < vocab.size(); i++) {
-        if (str == vocab[i])
-            return i;
-    }
-    return -1;
+
+    int id = find(vocab.begin(), vocab.end(), str) - vocab.begin();
+    return id < vocab.size() ? id : -1;
 }
 
-void bpe_encode(vector<int>* tokens_ptr, const char* text, const vector<string>& vocab) {
+void bpe_encode(vector<int>* tokens_ptr, const string& text, const vector<string>& vocab) {
 
     vector<int>& tokens = *tokens_ptr; // syntactic sugar
+    string str;
 
     // First encode every individual character in the input string
-    while (*text) {
+    for (int i = 0, start = 0; i < text.size(); start = i) {
         // In UTF-8 character any byte but the first has format 10xxxxxx
-        const char* start = text;
-        do text++; while ((*text & 0xc0) == 0x80);
-        int id = str_lookup(string(start, text - start), vocab);
+        while ((text[++i] & 0xc0) == 0x80) {}
+        str = text.substr(start, i - start);
+        int id = str_lookup(str, vocab);
         if (id == -1) {
-            fprintf(stderr, "First character in <%s> not in vocab\n", start);
+            cerr << "Character <" << str << "> not in vocab" << endl;
             exit(EXIT_FAILURE);
         }
         tokens.push_back(id);
@@ -536,7 +523,8 @@ void bpe_encode(vector<int>* tokens_ptr, const char* text, const vector<string>&
         int i = 0;
         for (int next = i+1; next < tokens.size(); next++) {
             // check if we can merge the pair (token[i], token[next])
-            int id = str_lookup(vocab[tokens[i]] + vocab[tokens[next]], vocab);
+            str = vocab[tokens[i]] + vocab[tokens[next]];
+            int id = str_lookup(str, vocab);
             if (id == -1)
                 tokens[++i] = tokens[next]; // can't merge further, move to next
             else
@@ -589,17 +577,18 @@ long run_model(int* steps, float temperature, float topp, const vector<int>& pro
             }
         }
 
-        pos++; // before a possible break due to BOS
+        pos++; // increment before a possible break due to BOS
 
         // data-dependent terminating condition: the BOS (1) token delimits sequences
         if (next == 1)
             break;
 
         // following BOS (1) token, sentencepiece decoder strips any leading whitespace (see PR #89)
-        string token_str = vocab[next];
-        if (token == 1 && token_str[0] == ' ')
-            token_str.erase(0, 1);
-        cout << token_str << std::flush;
+        string next_str = vocab[next];
+        if (token == 1 && next_str[0] == ' ')
+            next_str.erase(0, 1);
+
+        cout << next_str << std::flush;
         token = next;
 
         // init the timer here because the first iteration can be slower
@@ -641,9 +630,9 @@ int main(int argc, char* argv[]) {
     char* checkpoint;         // e.g. out/model.bin
     float temperature = 1.0f; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 0.9f;        // top-p in nucleus sampling
+    RNG::seed = 0;            // seed rng with time by default
     int steps = 256;          // max number of steps to run for, 0: use seq_len
     string prompt;            // prompt string
-    RNG::seed = (unsigned int)time(NULL); // seed rng with time by default, ensures != 0
 
     // 'checkpoint' is necessary, optional arguments and their values
     // come in pairs, so argc must be even.
@@ -658,7 +647,7 @@ int main(int argc, char* argv[]) {
         for (int i = 0; i < opt.size(); i += 2) {
             if      (opt[i] == "-t") temperature = stof(opt[i+1]);
             else if (opt[i] == "-p") topp = stof(opt[i+1]);
-            else if (opt[i] == "-s") RNG::seed = stoi(opt[i+1]); // FIXME cannot be 0
+            else if (opt[i] == "-s") RNG::seed = stoi(opt[i+1]);
             else if (opt[i] == "-n") steps = stoi(opt[i+1]);
             else if (opt[i] == "-i") prompt = opt[i+1];
             else
@@ -666,7 +655,10 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Read in the model.bin file
+    if (RNG::seed == 0)
+        RNG::seed = (unsigned int)time(NULL);
+
+    // Read in model.bin
     Config config;
     TransformerWeights weights;
     vector<string> vocab;
@@ -683,7 +675,7 @@ int main(int argc, char* argv[]) {
     // Process the prompt, if any
     vector<int> prompt_tokens;
     if (!prompt.empty())
-        bpe_encode(&prompt_tokens, prompt.c_str(), vocab);
+        bpe_encode(&prompt_tokens, prompt, vocab);
 
     // Right now we cannot run for more than config.seq_len steps
     if (steps <= 0 || steps > config.seq_len)
