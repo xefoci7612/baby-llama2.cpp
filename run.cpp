@@ -274,15 +274,29 @@ int argmax(float* prob, int n) {
 // tokens that exceed probability topp. This way we never sample tokens that
 // have very low probabilities and are less likely to go "off the rails".
 //
+// top-k sampling samples from the K set of tokens with the highest probabities.
+// If enabled, top-k will be performed before top-p (speeding up top-p).
+//
 // if topp <= 0 simply sample from the predicted probability distribution
-int sample(float* prob, float topp, const vector<int>& range) {
+int sample(float* prob, int topk, float topp, const vector<int>& range) {
 
-    vector v(range); // init with range 0..vocab_size-1
+    auto greater_prob = [&prob](int i1, int i2) { return prob[i1] > prob[i2]; };
+    vector<int> v(range); // init with range 0..vocab_size-1
     float cumulative_prob = 1.0f;
+
+    if (topk > 0 && topk < v.size()) {
+        // move to front the topk indices with highest probability and resize
+        nth_element(v.begin(), v.begin() + topk, v.end(), greater_prob);
+        v.resize(topk);
+        float sum = 0.0;
+        // re-normalize probabilities so that sum is 1
+        for (int i : v) { sum += prob[i]; }
+        for (int i : v) { prob[i] /= sum; }
+    }
 
     if (topp > 0) {
         // sort v in descending order of indexed probabilities
-        sort(v.begin(), v.end(), [&prob](int i1, int i2) { return prob[i1] > prob[i2]; });
+        sort(v.begin(), v.end(), greater_prob);
 
         // truncate the list where cumulative probability exceeds topp
         cumulative_prob = 0.0f;
@@ -539,8 +553,8 @@ void bpe_encode(vector<int>* tokens_ptr, const string& text, const vector<string
 // ----------------------------------------------------------------------------
 // main loop, runs model inference
 
-long run_model(int* steps, float temperature, float topp, const vector<int>& prompt_tokens, RunState& state,
-               Config& config, TransformerWeights& weights, const vector<string>& vocab) {
+long run_model(int* steps, float temperature, float topp, int topk, const vector<int>& prompt_tokens,
+               RunState& state, Config& config, TransformerWeights& weights, const vector<string>& vocab) {
 
     long start = 0; // used to time our code, only initialized after first iteration
     int next;       // will store the next token in the sequence
@@ -571,9 +585,10 @@ long run_model(int* steps, float temperature, float topp, const vector<int>& pro
                 softmax(state.logits, config.vocab_size, temperature);
 
                 // sample from this distribution to get the next token
-                // if topp > 0 we perform top-p (nucleus) sampling, clamping the least likely
+                // if topk > 0 we perform top-k sampling, sampling among the top k tokens,
+                // if topp > 0 we (also) perform top-p (nucleus) sampling, clamping the least likely
                 // tokens to zero. Othewise sample from the predicted probability distribution.
-                next = sample(state.logits, topp, range);
+                next = sample(state.logits, topk, topp, range);
             }
         }
 
@@ -630,6 +645,7 @@ int main(int argc, char* argv[]) {
     char* checkpoint;         // e.g. out/model.bin
     float temperature = 1.0f; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 0.9f;        // top-p in nucleus sampling
+    int topk = 0;             // top-k in Top-K sampling, disabled by default
     RNG::seed = 0;            // seed rng with time by default
     int steps = 256;          // max number of steps to run for, 0: use seq_len
     string prompt;            // prompt string
@@ -647,6 +663,7 @@ int main(int argc, char* argv[]) {
         for (int i = 0; i < opt.size(); i += 2) {
             if      (opt[i] == "-t") temperature = stof(opt[i+1]);
             else if (opt[i] == "-p") topp = stof(opt[i+1]);
+            else if (opt[i] == "-k") topk = stoi(opt[i+1]);
             else if (opt[i] == "-s") RNG::seed = stoi(opt[i+1]);
             else if (opt[i] == "-n") steps = stoi(opt[i+1]);
             else if (opt[i] == "-i") prompt = opt[i+1];
@@ -682,7 +699,7 @@ int main(int argc, char* argv[]) {
         steps = config.seq_len;
 
     // Run the model for the given number of steps or until BOS token
-    long elapsed = run_model(&steps, temperature, topp, prompt_tokens, state, config, weights, vocab);
+    long elapsed = run_model(&steps, temperature, topp, topk, prompt_tokens, state, config, weights, vocab);
 
     // report achieved tok/s (steps-1 because the timer starts after first iteration)
     if (steps > 1)
