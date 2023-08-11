@@ -60,7 +60,7 @@ public:
     T* get_ptr(int len) {
         T* ptr = reinterpret_cast<T*>(cur);
         cur += len * sizeof(T);
-        if (cur - (char*)data > size) {
+        if (cur > (char*)(data) + size) {
             fprintf(stderr, "Mapping after file's end!\n");
             exit(EXIT_FAILURE);
         }
@@ -134,7 +134,7 @@ struct RunState {
     // Poor's man memory management
     vector<void*> allocs;
 
-    float* alloc(int n) {
+    float* alloc(size_t n) {
         // We calloc instead of malloc to keep valgrind happy
         void* d = calloc(n, sizeof(float));
         if (!d) {
@@ -145,11 +145,11 @@ struct RunState {
         return static_cast<float*>(d);
     }
 
-    RunState(const Config&, const TransformerWeights&);
+    RunState(const Config&);
    ~RunState() { for (void* d : allocs) free(d); }
 };
 
-RunState::RunState(const Config& p, const TransformerWeights& w) {
+RunState::RunState(const Config& p) {
 
     int head_size = p.dim / p.n_heads;
 
@@ -163,8 +163,8 @@ RunState::RunState(const Config& p, const TransformerWeights& w) {
     v   = alloc(p.dim);
     att = alloc(p.n_heads * p.seq_len);
     logits      = alloc(p.vocab_size);
-    key_cache   = alloc(p.n_layers * p.seq_len * p.dim);
-    value_cache = alloc(p.n_layers * p.seq_len * p.dim);
+    key_cache   = alloc(size_t(p.n_layers) * p.seq_len * p.dim);
+    value_cache = alloc(size_t(p.n_layers) * p.seq_len * p.dim);
     freq_cis    = alloc(p.seq_len * head_size);
 
     // Compute freq_cis table, don't load from model.bin
@@ -290,7 +290,7 @@ int sample(float* prob, int topk, float topp, int size) {
         if (prob[i] >= Threshold)
             v.push_back(i);
 
-    if (topk > 0 && topk < v.size()) {
+    if (topk > 0 && topk < (int)v.size()) {
         // move to front the topk indices with highest probability and resize
         nth_element(v.begin(), v.begin() + topk, v.end(), greater_prob);
         v.resize(topk);
@@ -427,7 +427,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         }
 
         // save key,value at this time step (pos) to our kv cache
-        size_t loff = l * p->seq_len * dim; // kv cache layer offset for convenience
+        size_t loff = size_t(l) * p->seq_len * dim; // kv cache layer offset for convenience
         float* key_cache_row = s->key_cache + loff + pos * dim;
         float* value_cache_row = s->value_cache + loff + pos * dim;
         memcpy(key_cache_row, s->k, dim * sizeof(float));
@@ -516,8 +516,8 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 
 int str_lookup(const string& str, const vector<string>& vocab) {
 
-    int id = find(vocab.begin(), vocab.end(), str) - vocab.begin();
-    return id < vocab.size() ? id : -1;
+    auto it = find(vocab.begin(), vocab.end(), str);
+    return it != vocab.end() ? it - vocab.begin() : -1;
 }
 
 void bpe_encode(vector<int>* tokens_ptr, const string& text, const vector<string>& vocab) {
@@ -526,7 +526,7 @@ void bpe_encode(vector<int>* tokens_ptr, const string& text, const vector<string
     string str;
 
     // First encode every individual character in the input string
-    for (int i = 0, start = 0; i < text.size(); start = i) {
+    for (size_t i = 0, start = 0; i < text.size(); start = i) {
         // In UTF-8 character any byte but the first has format 10xxxxxx
         while ((text[++i] & 0xc0) == 0x80) {}
         str = text.substr(start, i - start);
@@ -540,8 +540,8 @@ void bpe_encode(vector<int>* tokens_ptr, const string& text, const vector<string
 
     // Merge consecutive tokens until there are no more new merges
     while (true) {
-        int i = 0;
-        for (int next = i+1; next < tokens.size(); next++) {
+        size_t i = 0;
+        for (size_t next = i+1; next < tokens.size(); next++) {
             // check if we can merge the pair (token[i], token[next])
             str = vocab[tokens[i]] + vocab[tokens[next]];
             int id = str_lookup(str, vocab);
@@ -573,7 +573,7 @@ long run_model(int* steps, float temperature, float topp, int topk, const vector
         transformer(token, pos, &config, &state, &weights);
 
         // advance the state machine
-        if (pos < prompt_tokens.size()) {
+        if (pos < (int)prompt_tokens.size()) {
             // if we are still processing the input prompt, force the next prompt token
             next = prompt_tokens[pos];
         } else {
@@ -663,7 +663,7 @@ int main(int argc, char* argv[]) {
     // Read in any optional argument
     if (argc > 2) {
         vector<string> opt(argv + 2, argv + argc);
-        for (int i = 0; i < opt.size(); i += 2) {
+        for (size_t i = 0; i < opt.size(); i += 2) {
             if      (opt[i] == "-t") temperature = stof(opt[i+1]);
             else if (opt[i] == "-p") topp = stof(opt[i+1]);
             else if (opt[i] == "-k") topk = stoi(opt[i+1]);
@@ -690,7 +690,7 @@ int main(int argc, char* argv[]) {
     print_model_info(config, vocab);
 
     // Create and init the application RunState
-    RunState state(config, weights);
+    RunState state(config);
 
     // Process the prompt, if any
     vector<int> prompt_tokens;
