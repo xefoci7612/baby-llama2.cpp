@@ -57,9 +57,13 @@ public:
     ~MMap() { munmap(data, size); }
 
     template<typename T = float>
-    T* get_ptr(size_t len) {
+    T* get_ptr(int len) {
         T* ptr = reinterpret_cast<T*>(cur);
         cur += len * sizeof(T);
+        if (cur - (char*)data > size) {
+            fprintf(stderr, "Mapping after file's end!\n");
+            exit(EXIT_FAILURE);
+        }
         return ptr;
     }
 
@@ -74,13 +78,13 @@ public:
 // Transformer and RunState structs, and related initializations
 
 struct Config {
-    size_t dim;        // transformer dimension
-    size_t hidden_dim; // for ffn layers
-    size_t n_layers;   // number of layers
-    size_t n_heads;    // number of query heads
-    size_t n_kv_heads; // number of key/value heads (can be < query heads because of multiquery)
-    size_t vocab_size; // vocabulary size, usually 256 (byte-level)
-    size_t seq_len;    // max sequence length
+    int32_t dim;        // transformer dimension
+    int32_t hidden_dim; // for ffn layers
+    int32_t n_layers;   // number of layers
+    int32_t n_heads;    // number of query heads
+    int32_t n_kv_heads; // number of key/value heads (can be < query heads because of multiquery)
+    int32_t vocab_size; // vocabulary size, usually 256 (byte-level)
+    int32_t seq_len;    // max sequence length
 };
 
 struct TransformerWeights {
@@ -130,14 +134,15 @@ struct RunState {
     // Poor's man memory management
     vector<void*> allocs;
 
-    float* alloc(size_t n) {
+    float* alloc(int n) {
         // We calloc instead of malloc to keep valgrind happy
-        allocs.push_back(calloc(n, sizeof(float)));
-        if (!allocs.back()) {
+        void* d = calloc(n, sizeof(float));
+        if (!d) {
             fprintf(stderr, "Cannot allocate run state!\n");
             exit(EXIT_FAILURE);
         }
-        return static_cast<float*>(allocs.back());
+        allocs.push_back(d);
+        return static_cast<float*>(d);
     }
 
     RunState(const Config&, const TransformerWeights&);
@@ -146,7 +151,7 @@ struct RunState {
 
 RunState::RunState(const Config& p, const TransformerWeights& w) {
 
-    size_t head_size = p.dim / p.n_heads;
+    int head_size = p.dim / p.n_heads;
 
     x   = alloc(p.dim);
     xb  = alloc(p.dim);
@@ -163,8 +168,8 @@ RunState::RunState(const Config& p, const TransformerWeights& w) {
     freq_cis    = alloc(p.seq_len * head_size);
 
     // Compute freq_cis table, don't load from model.bin
-    float theta = 1e+08;
     float* ptr = freq_cis;
+    float theta = 1e+08;
     for (int pos = 0; pos < p.seq_len; pos++) {
         for (int i = 0; i < head_size / 2; i++) {
             float freq = 1.0 / pow(theta, float(i) / head_size);
@@ -177,7 +182,7 @@ RunState::RunState(const Config& p, const TransformerWeights& w) {
 
 void TransformerWeights::init(MMap& m, Config* p, bool shared_weights) {
 
-    size_t head_size = p->dim / p->n_heads;
+    int head_size = p->dim / p->n_heads;
 
     token_embedding_table = m.get_ptr(p->vocab_size * p->dim);
     rms_att_weight        = m.get_ptr(p->n_layers * p->dim);
@@ -193,7 +198,7 @@ void TransformerWeights::init(MMap& m, Config* p, bool shared_weights) {
  /* freq_cis_real */        m.get_ptr(p->seq_len * head_size / 2);
  /* freq_cis_imag */        m.get_ptr(p->seq_len * head_size / 2);
 
-    wcls = shared_weights ? token_embedding_table : m.get_ptr(1);
+    wcls = shared_weights ? token_embedding_table : m.get_ptr(p->vocab_size * p->dim);
 }
 
 void init_from_mmap(MMap& m, Config* config, TransformerWeights* weights, vector<string>* vocab) {
@@ -202,24 +207,17 @@ void init_from_mmap(MMap& m, Config* config, TransformerWeights* weights, vector
     float score;
     bool shared_weights;
 
-    // Read in the config header, values are int32_t on disk
-    // but we want them to be size_t.
-    static const size_t N = sizeof(Config) / sizeof(size_t);
-
-    // All Config fields are size_t, so define a union with
-    // an array to iterate over them.
-    union U { struct Config; size_t vec[N]; };
-    size_t* ptr = reinterpret_cast<U*>(config)->vec;
-
-    for (size_t i = 0; i < N; i++) {
-        m >> x;
-        *ptr++ = static_cast<size_t>(x);
-    }
+    // Read in the config header, all Config fields are int32_t,
+    // so define a union with an array to iterate over them
+    static const int N = sizeof(Config) / sizeof(int32_t);
+    union U { struct Config; int32_t vec[N]; };
+    int32_t* it = reinterpret_cast<U*>(config)->vec;
+    for (int i = 0; i < N; i++)
+        m >> *it++;
 
     // Negative vocab size is hacky way of signaling unshared weights. bit yikes.
-    x = static_cast<int32_t>(config->vocab_size);
-    shared_weights = (x > 0);
-    config->vocab_size = abs(x);
+    shared_weights = (config->vocab_size > 0);
+    config->vocab_size = abs(config->vocab_size);
 
     // Memory map the Transformer weights into the data pointer
     weights->init(m, config, shared_weights);
@@ -228,7 +226,7 @@ void init_from_mmap(MMap& m, Config* config, TransformerWeights* weights, vector
     MMap t("tokenizer.bin");
     t >> x; // ignore max_token_length
 
-    for (size_t i = 0; i < config->vocab_size; i++) {
+    for (int i = 0; i < config->vocab_size; i++) {
         t >> score >> len; // ignore scores
         char* c = t.get_ptr<char>(len);
         vocab->push_back(string(c, len));
@@ -396,9 +394,9 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 
     // a few convenience variables
     float* x = s->x;
-    size_t dim = p->dim;
-    size_t hidden_dim =  p->hidden_dim;
-    size_t head_size = dim / p->n_heads;
+    int dim = p->dim;
+    int hidden_dim =  p->hidden_dim;
+    int head_size = dim / p->n_heads;
 
     // copy the token embedding into x
     float* content_row = w->token_embedding_table + token * dim;
@@ -408,7 +406,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     float* fr = s->freq_cis + pos * head_size;
 
     // forward all the layers
-    for (size_t l = 0; l < p->n_layers; l++) {
+    for (int l = 0; l < p->n_layers; l++) {
 
         // attention rmsnorm (Root Mean Square normalization)
         rmsnorm(s->xb, x, w->rms_att_weight + l * dim, dim);
