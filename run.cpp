@@ -133,6 +133,7 @@ struct RunState {
 
     // Poor's man memory management
     vector<void*> allocs;
+    size_t allocated_size = 0;
 
     float* alloc(size_t n) {
         // We calloc instead of malloc to keep valgrind happy
@@ -141,6 +142,7 @@ struct RunState {
             fprintf(stderr, "Cannot allocate run state!\n");
             exit(EXIT_FAILURE);
         }
+        allocated_size += n * sizeof(float);
         allocs.push_back(d);
         return static_cast<float*>(d);
     }
@@ -617,7 +619,7 @@ long run_model(int* steps, float temperature, float topp, int topk, const vector
     return time_in_ms() - start; // elapsed time in ms
 }
 
-void print_model_info(const Config& config, vector<string>& vocab) {
+void print_model_info(const Config& config, const RunState& state, vector<string>& vocab) {
     cerr << "\nModel parameters:\n"
          << "\n    Vocab size " << vocab.size()
          << "\n    Dimension " << config.dim
@@ -626,6 +628,7 @@ void print_model_info(const Config& config, vector<string>& vocab) {
          << "\n    Head size (dim / num heads) " << config.dim / config.n_heads
          << "\n    Num layers " << config.n_layers
          << "\n    Max context (tokens) " << config.seq_len
+         << "\n    Allocated memory (MB) " << state.allocated_size / (1024 * 1024)
          << "\n" << endl;
 }
 
@@ -687,10 +690,10 @@ int main(int argc, char* argv[]) {
     MMap mmap(checkpoint);
     init_from_mmap(mmap, &config, &weights, &vocab);
 
-    print_model_info(config, vocab);
-
     // Create and init the application RunState
     RunState state(config);
+
+    print_model_info(config, state, vocab);
 
     // Process the prompt, if any
     vector<int> prompt_tokens;
