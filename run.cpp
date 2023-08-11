@@ -1,5 +1,5 @@
 /*
-Inference for Llama-2 Transformer model in C++
+Inference for Llama-2 Transformer model in C/C++
 
 Example compile: (see README for more details)
 $ g++ -O3 -o run run.cpp -lm
@@ -21,7 +21,7 @@ $ ./run
     #include <sys/mman.h>
 #endif
 
-#include <algorithm> // std::sort
+#include <algorithm>
 #include <iostream>
 #include <vector>
 #include <sys/stat.h>
@@ -54,23 +54,17 @@ public:
         size = fileInfo.st_size;
         close(fd); // we can close the file once mapped
     }
-    ~MMap() { munmap(data, size); }
+   ~MMap() { munmap(data, size); }
 
     template<typename T = float>
-    T* get_ptr(int len) {
+    T* next(size_t n = 1) {
         T* ptr = reinterpret_cast<T*>(cur);
-        cur += len * sizeof(T);
+        cur += n * sizeof(T);
         if (cur > (char*)(data) + size) {
-            fprintf(stderr, "Mapping after file's end!\n");
+            fprintf(stderr, "Mapping after end of file!\n");
             exit(EXIT_FAILURE);
         }
         return ptr;
-    }
-
-    template<typename T>
-    MMap& operator>> (T& rhs) {
-        rhs = *this->get_ptr<T>(1);
-        return *this;
     }
 };
 
@@ -109,8 +103,6 @@ struct TransformerWeights {
     // freq_cis_imag (seq_len, head_size / 2) we don't use it
     // (optional) classifier weights for the logits, on the last layer
     float* wcls;
-
-    void init(MMap&, Config* p, bool shared_weights);
 };
 
 struct RunState {
@@ -135,6 +127,9 @@ struct RunState {
     vector<void*> allocs;
     size_t allocated_size = 0;
 
+    RunState(const Config&);
+   ~RunState() { for (void* d : allocs) free(d); }
+
     float* alloc(size_t n) {
         // We calloc instead of malloc to keep valgrind happy
         void* d = calloc(n, sizeof(float));
@@ -146,14 +141,12 @@ struct RunState {
         allocs.push_back(d);
         return static_cast<float*>(d);
     }
-
-    RunState(const Config&);
-   ~RunState() { for (void* d : allocs) free(d); }
 };
 
 RunState::RunState(const Config& p) {
 
     int head_size = p.dim / p.n_heads;
+    size_t n_layers = size_t(p.n_layers); // ensure product is size_t
 
     x   = alloc(p.dim);
     xb  = alloc(p.dim);
@@ -165,11 +158,11 @@ RunState::RunState(const Config& p) {
     v   = alloc(p.dim);
     att = alloc(p.n_heads * p.seq_len);
     logits      = alloc(p.vocab_size);
-    key_cache   = alloc(size_t(p.n_layers) * p.seq_len * p.dim);
-    value_cache = alloc(size_t(p.n_layers) * p.seq_len * p.dim);
+    key_cache   = alloc(n_layers * p.seq_len * p.dim);
+    value_cache = alloc(n_layers * p.seq_len * p.dim);
     freq_cis    = alloc(p.seq_len * head_size);
 
-    // Compute freq_cis table, don't load from model.bin
+    // Compute freq_cis, don't load from model.bin
     float* ptr = freq_cis;
     float theta = 1e+08;
     for (int pos = 0; pos < p.seq_len; pos++) {
@@ -182,55 +175,48 @@ RunState::RunState(const Config& p) {
     }
 }
 
-void TransformerWeights::init(MMap& m, Config* p, bool shared_weights) {
+void init_from_mmap(MMap& m, Config* p, TransformerWeights* w, vector<string>* vocab) {
 
-    int head_size = p->dim / p->n_heads;
-
-    token_embedding_table = m.get_ptr(p->vocab_size * p->dim);
-    rms_att_weight        = m.get_ptr(p->n_layers * p->dim);
-    wq                    = m.get_ptr(p->n_layers * p->dim * p->dim);
-    wk                    = m.get_ptr(p->n_layers * p->dim * p->dim);
-    wv                    = m.get_ptr(p->n_layers * p->dim * p->dim);
-    wo                    = m.get_ptr(p->n_layers * p->dim * p->dim);
-    rms_ffn_weight        = m.get_ptr(p->n_layers * p->dim);
-    w1                    = m.get_ptr(p->n_layers * p->dim * p->hidden_dim);
-    w2                    = m.get_ptr(p->n_layers * p->dim * p->hidden_dim);
-    w3                    = m.get_ptr(p->n_layers * p->dim * p->hidden_dim);
-    rms_final_weight      = m.get_ptr(p->dim);
- /* freq_cis_real */        m.get_ptr(p->seq_len * head_size / 2);
- /* freq_cis_imag */        m.get_ptr(p->seq_len * head_size / 2);
-
-    wcls = shared_weights ? token_embedding_table : m.get_ptr(p->vocab_size * p->dim);
-}
-
-void init_from_mmap(MMap& m, Config* config, TransformerWeights* weights, vector<string>* vocab) {
-
-    int32_t x, len;
-    float score;
-    bool shared_weights;
-
-    // Read in the config header, all Config fields are int32_t,
+    // Read in config header, all Config fields are int32_t,
     // so define a union with an array to iterate over them
     static const int N = sizeof(Config) / sizeof(int32_t);
     union U { struct Config; int32_t vec[N]; };
-    int32_t* it = reinterpret_cast<U*>(config)->vec;
+    int32_t* v = reinterpret_cast<U*>(p)->vec;
     for (int i = 0; i < N; i++)
-        m >> *it++;
+        v[i] = *m.next<int32_t>();
 
     // Negative vocab size is hacky way of signaling unshared weights. bit yikes.
-    shared_weights = (config->vocab_size > 0);
-    config->vocab_size = abs(config->vocab_size);
+    bool shared_weights = (p->vocab_size > 0);
+    p->vocab_size = abs(p->vocab_size);
 
     // Memory map the Transformer weights into the data pointer
-    weights->init(m, config, shared_weights);
+    int head_size = p->dim / p->n_heads;
+    size_t dim = size_t(p->dim); // ensure product is size_t
 
-    // Read in tokenizer.bin
+    w->token_embedding_table = m.next(p->vocab_size * dim);
+    w->rms_att_weight        = m.next(p->n_layers * dim);
+    w->wq                    = m.next(p->n_layers * dim * dim);
+    w->wk                    = m.next(p->n_layers * dim * dim);
+    w->wv                    = m.next(p->n_layers * dim * dim);
+    w->wo                    = m.next(p->n_layers * dim * dim);
+    w->rms_ffn_weight        = m.next(p->n_layers * dim);
+    w->w1                    = m.next(p->n_layers * dim * p->hidden_dim);
+    w->w2                    = m.next(p->n_layers * dim * p->hidden_dim);
+    w->w3                    = m.next(p->n_layers * dim * p->hidden_dim);
+    w->rms_final_weight      = m.next(dim);
+ /* w->freq_cis_real */        m.next(p->seq_len * head_size / 2);
+ /* w->freq_cis_imag */        m.next(p->seq_len * head_size / 2);
+
+    w->wcls = shared_weights ? w->token_embedding_table : m.next(p->vocab_size * dim);
+
+    // Read in vocab
     MMap t("tokenizer.bin");
-    t >> x; // ignore max_token_length
+    t.next<float>(); // ignore max_token_length
 
-    for (int i = 0; i < config->vocab_size; i++) {
-        t >> score >> len; // ignore scores
-        char* c = t.get_ptr<char>(len);
+    for (int i = 0; i < p->vocab_size; i++) {
+        t.next<float>(); // ignore score
+        int32_t len = *t.next<int32_t>();
+        char* c = t.next<char>(len);
         vocab->push_back(string(c, len));
     }
 }
@@ -282,7 +268,7 @@ int sample(float* prob, int topk, float topp, int size) {
 
     static const float Threshold = 1e-5;
 
-    auto greater_prob = [&prob](int i1, int i2) { return prob[i1] > prob[i2]; };
+    auto greater_prob = [&prob](int a, int b) { return prob[a] > prob[b]; };
     vector<int> v;
     v.reserve(size);
     float cumulative_prob = 1.0f;
@@ -296,14 +282,14 @@ int sample(float* prob, int topk, float topp, int size) {
         // move to front the topk indices with highest probability and resize
         nth_element(v.begin(), v.begin() + topk, v.end(), greater_prob);
         v.resize(topk);
-        float sum = 0.0;
         // normalize probabilities so that sum is 1
+        float sum = 0.0;
         for (int i : v) { sum += prob[i]; }
         for (int i : v) { prob[i] /= sum; }
     }
 
-    if (topp > 0) {
-        // sort v in descending order of indexed probabilities
+    if (topp > 0 && topp < 1) {
+        // sort in descending order of indexed probabilities
         sort(v.begin(), v.end(), greater_prob);
 
         // truncate the list where cumulative probability exceeds topp
@@ -540,10 +526,10 @@ void bpe_encode(vector<int>* tokens_ptr, const string& text, const vector<string
         tokens.push_back(id);
     }
 
-    // Merge consecutive tokens until there are no more new merges
+    // Greedy merge consecutive tokens until there are no more new merges
     while (true) {
         size_t i = 0;
-        for (size_t next = i+1; next < tokens.size(); next++) {
+        for (size_t next = i + 1; next < tokens.size(); next++) {
             // check if we can merge the pair (token[i], token[next])
             str = vocab[tokens[i]] + vocab[tokens[next]];
             int id = str_lookup(str, vocab);
@@ -564,10 +550,12 @@ void bpe_encode(vector<int>* tokens_ptr, const string& text, const vector<string
 long run_model(int* steps, float temperature, float topp, int topk, const vector<int>& prompt_tokens,
                RunState& state, Config& config, TransformerWeights& weights, const vector<string>& vocab) {
 
-    long start = 0; // used to time our code, only initialized after first iteration
-    int next;       // will store the next token in the sequence
-    int token = 1;  // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
-    int pos = 0;    // position in the sequence
+    static const int BOS = 1; // BOS token
+
+    long start = 0;  // used to time our code, only initialized after first iteration
+    int next;        // will store the next token in the sequence
+    int token = BOS; // init with token BOS, as done in Llama-2 sentencepiece tokenizer
+    int pos = 0;     // position in the sequence
 
     while (pos < *steps) {
 
@@ -596,15 +584,15 @@ long run_model(int* steps, float temperature, float topp, int topk, const vector
             }
         }
 
-        pos++; // increment before a possible break due to BOS
+        pos++; // increment before a possible early exit due to a BOS token
 
-        // data-dependent terminating condition: the BOS (1) token delimits sequences
-        if (next == 1)
+        // data-dependent terminating condition: the BOS token delimits sequences
+        if (next == BOS)
             break;
 
-        // following BOS (1) token, sentencepiece decoder strips any leading whitespace (see PR #89)
+        // following BOS token, sentencepiece decoder strips any leading whitespace (see PR #89)
         string next_str = vocab[next];
-        if (token == 1 && next_str[0] == ' ')
+        if (token == BOS && next_str[0] == ' ')
             next_str.erase(0, 1);
 
         cout << next_str << std::flush;
