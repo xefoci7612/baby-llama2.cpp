@@ -263,7 +263,7 @@ namespace RNG {
 };
 
 // ----------------------------------------------------------------------------
-// sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
+// sampling can be done in a few ways: greedy argmax, sampling, top-p or top-k sampling
 
 int argmax(float* prob, int n) {
     // return the index that has the highest probability
@@ -275,21 +275,29 @@ int argmax(float* prob, int n) {
 // have very low probabilities and are less likely to go "off the rails".
 //
 // top-k sampling samples from the K set of tokens with the highest probabities.
-// If enabled, top-k will be performed before top-p (speeding up top-p).
+// If enabled, top-k will be performed before top-p.
 //
-// if topp <= 0 simply sample from the predicted probability distribution
-int sample(float* prob, int topk, float topp, const vector<int>& range) {
+// if topp and topk <= 0 simply sample from the predicted probability distribution
+int sample(float* prob, int topk, float topp, int size) {
+
+    static const float Threshold = 1e-5;
 
     auto greater_prob = [&prob](int i1, int i2) { return prob[i1] > prob[i2]; };
-    vector<int> v(range); // init with range 0..vocab_size-1
+    vector<int> v;
+    v.reserve(size);
     float cumulative_prob = 1.0f;
+
+    // Skip probabilities below threshold to speed up sorting
+    for (int i = 0; i < size; i++)
+        if (prob[i] >= Threshold)
+            v.push_back(i);
 
     if (topk > 0 && topk < v.size()) {
         // move to front the topk indices with highest probability and resize
         nth_element(v.begin(), v.begin() + topk, v.end(), greater_prob);
         v.resize(topk);
         float sum = 0.0;
-        // re-normalize probabilities so that sum is 1
+        // normalize probabilities so that sum is 1
         for (int i : v) { sum += prob[i]; }
         for (int i : v) { prob[i] /= sum; }
     }
@@ -561,10 +569,6 @@ long run_model(int* steps, float temperature, float topp, int topk, const vector
     int token = 1;  // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
     int pos = 0;    // position in the sequence
 
-    // fill a helper vector with range 0..vocab_size-1, used in sample
-    vector<int> range(config.vocab_size);
-    for (int i = 0; i < range.size(); i++) { range[i] = i; }
-
     while (pos < *steps) {
 
         // forward the transformer to get logits for the next token
@@ -588,7 +592,7 @@ long run_model(int* steps, float temperature, float topp, int topk, const vector
                 // if topk > 0 we perform top-k sampling, sampling among the top k tokens,
                 // if topp > 0 we (also) perform top-p (nucleus) sampling, clamping the least likely
                 // tokens to zero. Othewise sample from the predicted probability distribution.
-                next = sample(state.logits, topk, topp, range);
+                next = sample(state.logits, topk, topp, config.vocab_size);
             }
         }
 
@@ -633,6 +637,7 @@ void error_usage() {
             "Options:\n"
             "  -t <float>  temperature, default 1.0\n"
             "  -p <float>  p value in top-p (nucleus) sampling. default 0.9, 0 = off\n"
+            "  -k <int>    k value in top-k sampling. disabled by default, 0 = off\n"
             "  -s <int>    random seed, default time(NULL)\n"
             "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n"
             "  -i <string> input prompt\n" << endl;
