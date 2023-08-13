@@ -69,36 +69,47 @@ public:
 };
 
 // ----------------------------------------------------------------------------
-// A dynamic multi-dimensional array M(x, y) -> &M[x][y], M(x) -> M[x]
+// A dynamic multi-dimensional array M(x,y) -> &M[x][y], M(x) -> M[x]
 
 template <size_t N> struct Array;
 
 template<>
 struct Array<1> {
 
-   ~Array() { free(base); }
+   ~Array() { if (!mem_mapped) { free(base); } }
 
-    // Implicit decay to pointer as native C array
+    // implicit decay to pointer as a native C array
     operator float*() const { return base; }
 
-    // operator() returns a pointer to the indexed item
+    // return a pointer to the indexed item
     float* operator()(size_t x) { return base + x; }
 
     void alloc(size_t n) {
-        // We calloc instead of malloc to keep valgrind happy
-        base = (float*)calloc(n, sizeof(float));
-        if (!base) {
-            fprintf(stderr, "Cannot allocate run state!\n");
-            exit(EXIT_FAILURE);
+        if (!mem_mapped) {
+            // we calloc instead of malloc to keep valgrind happy
+            base = (float*)calloc(n, sizeof(float));
+            if (!base) {
+                fprintf(stderr, "Cannot allocate run state!\n");
+                exit(EXIT_FAILURE);
+            }
         }
     }
 
     float* base = NULL;
+    bool mem_mapped = false;
 };
 
-// Helper to multiply args using a fold expressions
+// Helper to multiply args with a fold expressions
 template<typename... Args>
-size_t argmul(Args... args) { return (1 * ... * args); }
+size_t argmul(Args... args) { return (size_t(1) * ... * args); }
+
+// Helper to map a file into an Array
+template<size_t N, typename... Args>
+void map_array(MMap& m, Array<N>& a, Args... args) {
+    a.base = m.next(argmul(args...));
+    a.mem_mapped = true; // prevent new memory allocation
+    a.alloc(args...);
+}
 
 template <size_t N>
 struct Array : Array<N-1> {
@@ -132,21 +143,21 @@ struct Config {
 
 struct TransformerWeights {
     // token embedding table
-    float* token_embedding_table; // (vocab_size, dim)
+    Array<2> token_embedding_table; // (vocab_size, dim)
     // weights for rmsnorms
-    float* rms_att_weight; // (layer, dim)
-    float* rms_ffn_weight; // (layer, dim)
+    Array<2> rms_att_weight; // (layer, dim)
+    Array<2> rms_ffn_weight; // (layer, dim)
     // weights for matmuls
-    float* wq; // (layer, dim, dim)
-    float* wk; // (layer, dim, dim)
-    float* wv; // (layer, dim, dim)
-    float* wo; // (layer, dim, dim)
+    Array<3> wq; // (layer, dim, dim)
+    Array<3> wk; // (layer, dim, dim)
+    Array<3> wv; // (layer, dim, dim)
+    Array<3> wo; // (layer, dim, dim)
     // weights for ffn
-    float* w1; // (layer, hidden_dim, dim)
-    float* w2; // (layer, dim, hidden_dim)
-    float* w3; // (layer, hidden_dim, dim)
+    Array<3> w1; // (layer, hidden_dim, dim)
+    Array<3> w2; // (layer, dim, hidden_dim)
+    Array<3> w3; // (layer, hidden_dim, dim)
     // final rmsnorm
-    float* rms_final_weight; // (dim,)
+    Array<1> rms_final_weight; // (dim,)
     // freq_cis for RoPE relatively positional embeddings
     // freq_cis_real (seq_len, head_size / 2) we don't use it
     // freq_cis_imag (seq_len, head_size / 2) we don't use it
@@ -178,7 +189,6 @@ struct RunState {
 RunState::RunState(const Config& p) {
 
     int head_size = p.dim / p.n_heads;
-    size_t n_layers = size_t(p.n_layers); // ensure product is size_t
 
     x.alloc(p.dim);
     xb.alloc(p.n_heads, head_size); // dim = n_heads * head_size
@@ -190,8 +200,8 @@ RunState::RunState(const Config& p) {
     v.alloc(p.n_heads, head_size);  // dim
     att.alloc(p.n_heads, p.seq_len);
     logits.alloc(p.vocab_size);
-    key_cache.alloc(n_layers, p.seq_len, p.n_heads, head_size);
-    value_cache.alloc(n_layers, p.seq_len, p.n_heads, head_size);
+    key_cache.alloc(p.n_layers, p.seq_len, p.n_heads, head_size);
+    value_cache.alloc(p.n_layers, p.seq_len, p.n_heads, head_size);
     freq_cis.alloc(p.seq_len, head_size);
 
     // Compute freq_cis, don't load from model.bin
@@ -223,23 +233,23 @@ void init_from_mmap(MMap& m, Config* p, TransformerWeights* w, vector<string>* v
 
     // Memory map the Transformer weights into the data pointer
     int head_size = p->dim / p->n_heads;
-    size_t dim = size_t(p->dim); // ensure product is size_t
 
-    w->token_embedding_table = m.next(p->vocab_size * dim);
-    w->rms_att_weight        = m.next(p->n_layers * dim);
-    w->wq                    = m.next(p->n_layers * dim * dim);
-    w->wk                    = m.next(p->n_layers * dim * dim);
-    w->wv                    = m.next(p->n_layers * dim * dim);
-    w->wo                    = m.next(p->n_layers * dim * dim);
-    w->rms_ffn_weight        = m.next(p->n_layers * dim);
-    w->w1                    = m.next(p->n_layers * dim * p->hidden_dim);
-    w->w2                    = m.next(p->n_layers * dim * p->hidden_dim);
-    w->w3                    = m.next(p->n_layers * dim * p->hidden_dim);
-    w->rms_final_weight      = m.next(dim);
- /* w->freq_cis_real */        m.next(p->seq_len * head_size / 2);
- /* w->freq_cis_imag */        m.next(p->seq_len * head_size / 2);
+    map_array(m, w->token_embedding_table, p->vocab_size, p->dim);
+    map_array(m, w->rms_att_weight, p->n_layers, p->dim);
+    map_array(m, w->wq, p->n_layers, p->dim, p->dim);
+    map_array(m, w->wk, p->n_layers, p->dim, p->dim);
+    map_array(m, w->wv, p->n_layers, p->dim, p->dim);
+    map_array(m, w->wo, p->n_layers, p->dim, p->dim);
+    map_array(m, w->rms_ffn_weight, p->n_layers, p->dim);
+    map_array(m, w->w1, p->n_layers, p->hidden_dim, p->dim);
+    map_array(m, w->w2, p->n_layers, p->dim, p->hidden_dim);
+    map_array(m, w->w3, p->n_layers, p->hidden_dim, p->dim);
+    map_array(m, w->rms_final_weight, p->dim);
 
-    w->wcls = shared_weights ? w->token_embedding_table : m.next(p->vocab_size * dim);
+ /* w->freq_cis_real */ m.next(p->seq_len * head_size / 2);
+ /* w->freq_cis_imag */ m.next(p->seq_len * head_size / 2);
+
+    w->wcls = shared_weights ? w->token_embedding_table : m.next(p->vocab_size * p->dim);
 
     // Read in vocab
     MMap t("tokenizer.bin");
@@ -419,31 +429,30 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     int head_size = dim / p->n_heads;
 
     // copy the token embedding into x
-    float* content_row = w->token_embedding_table + token * dim;
-    memcpy(x, content_row, dim * sizeof(float));
+    memcpy(x, w->token_embedding_table(token), dim * sizeof(float));
 
     // pluck out the "pos" row of freq_cis
-    float* fr = s->freq_cis(pos);
+    float* freq = s->freq_cis(pos);
 
     // forward all the layers
     for (int l = 0; l < p->n_layers; l++) {
 
         // attention rmsnorm (Root Mean Square normalization)
-        rmsnorm(s->xb, x, w->rms_att_weight + l * dim, dim);
+        rmsnorm(s->xb, x, w->rms_att_weight(l), dim);
 
         // qkv matmuls for this position (V X M = V)
-        matmul(s->q, s->xb, w->wq + l * dim * dim, dim, dim);
-        matmul(s->k, s->xb, w->wk + l * dim * dim, dim, dim);
-        matmul(s->v, s->xb, w->wv + l * dim * dim, dim, dim);
+        matmul(s->q, s->xb, w->wq(l), dim, dim);
+        matmul(s->k, s->xb, w->wk(l), dim, dim);
+        matmul(s->v, s->xb, w->wv(l), dim, dim);
 
         // RoPE relative positional encoding: complex-valued
-        // rotate q and k by freq_cis in each head.
+        // rotate q and k by freq_cis
         int h;
         #pragma omp parallel for private(h)
         for (h = 0; h < p->n_heads; h++)
             for (int i = 0; i < head_size; i += 2) {
-                complexmul(s->q(h)+i, s->q(h)+i+1, fr[i], fr[i+1]);
-                complexmul(s->k(h)+i, s->k(h)+i+1, fr[i], fr[i+1]);
+                complexmul(s->q(h)+i, s->q(h)+i+1, freq[i], freq[i+1]);
+                complexmul(s->k(h)+i, s->k(h)+i+1, freq[i], freq[i+1]);
             }
 
         // save key,value at this time step (pos) to our kv cache
@@ -491,18 +500,18 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         }
 
         // final matmul to get the output of the attention
-        matmul(s->xb2, s->xb, w->wo + l * dim * dim, dim, dim);
+        matmul(s->xb2, s->xb, w->wo(l), dim, dim);
 
         // residual connection back into x
         accum(x, s->xb2, dim);
 
         // ffn rmsnorm
-        rmsnorm(s->xb, x, w->rms_ffn_weight + l * dim, dim);
+        rmsnorm(s->xb, x, w->rms_ffn_weight(l), dim);
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
-        matmul(s->hb, s->xb, w->w1 + l * dim * hidden_dim, dim, hidden_dim);
-        matmul(s->hb2, s->xb, w->w3 + l * dim * hidden_dim, dim, hidden_dim);
+        matmul(s->hb, s->xb, w->w1(l), dim, hidden_dim);
+        matmul(s->hb2, s->xb, w->w3(l), dim, hidden_dim);
 
         // F.silu; silu(x)=x*σ(x),where σ(x) is the logistic sigmoid
         for (int i = 0; i < hidden_dim; i++) {
@@ -515,7 +524,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         }
 
         // final matmul to get the output of the ffn
-        matmul(s->xb, s->hb, w->w2 + l * dim * hidden_dim, hidden_dim, dim);
+        matmul(s->xb, s->hb, w->w2(l), hidden_dim, dim);
 
         // residual connection
         accum(x, s->xb, dim);
