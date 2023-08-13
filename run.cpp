@@ -69,6 +69,55 @@ public:
 };
 
 // ----------------------------------------------------------------------------
+// A dynamic multi-dimensional array M(x, y) -> &M[x][y], M(x) -> M[x]
+
+template <size_t N> struct Array;
+
+template<>
+struct Array<1> {
+
+   ~Array() { free(base); }
+
+    // Implicit decay to pointer as native C array
+    operator float*() const { return base; }
+
+    // operator() returns a pointer to the indexed item
+    float* operator()(size_t x) { return base + x; }
+
+    void alloc(size_t n) {
+        // We calloc instead of malloc to keep valgrind happy
+        base = (float*)calloc(n, sizeof(float));
+        if (!base) {
+            fprintf(stderr, "Cannot allocate run state!\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    float* base = NULL;
+};
+
+// Helper to multiply args using a fold expressions
+template<typename... Args>
+size_t argmul(Args... args) { return (1 * ... * args); }
+
+template <size_t N>
+struct Array : Array<N-1> {
+
+    template<typename... Args>
+    void alloc(size_t a, size_t b, Args... args) { d = b * argmul(args...); Array<N-1>::alloc(a * b, args...); }
+
+    size_t addr(size_t x) { return d * x; }
+
+    template<typename... Args>
+    size_t addr(size_t x, Args... args) { return d * x + Array<N-1>::addr(args...); }
+
+    template<typename... Args>
+    float* operator()(Args... args) { return this->base + addr(args...); }
+
+    size_t d;
+};
+
+// ----------------------------------------------------------------------------
 // Transformer and RunState structs, and related initializations
 
 struct Config {
@@ -107,40 +156,23 @@ struct TransformerWeights {
 
 struct RunState {
     // Current wave of activations
-    float* x;   // activation at current time stamp (dim,)
-    float* xb;  // same, but inside a residual branch (dim,)
-    float* xb2; // an additional buffer just for convenience (dim,)
-    float* hb;  // buffer for hidden dimension in the ffn (hidden_dim,)
-    float* hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
-    float* q;   // query (dim,)
-    float* k;   // key (dim,)
-    float* v;   // value (dim,)
-    float* att; // buffer for scores/attention values (n_heads, seq_len)
-    float* logits; // output logits (vocab_size)
+    Array<1> x;   // activation at current time stamp (dim,)
+    Array<2> xb;  // same, but inside a residual branch (dim,)
+    Array<1> xb2; // an additional buffer just for convenience (dim,)
+    Array<1> hb;  // buffer for hidden dimension in the ffn (hidden_dim,)
+    Array<1> hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
+    Array<2> q;   // query (dim,)
+    Array<2> k;   // key (dim,)
+    Array<2> v;   // value (dim,)
+    Array<2> att; // buffer for scores/attention values (n_heads, seq_len)
+    Array<1> logits; // output logits (vocab_size)
     // Key and Value cache
-    float* key_cache;   // (layer, seq_len, dim)
-    float* value_cache; // (layer, seq_len, dim)
+    Array<4> key_cache;   // (layer, seq_len, n_heads, head_size)
+    Array<4> value_cache; // (layer, seq_len, n_heads, head_size)
     // freq_cis for RoPE relatively positional embeddings
-    float* freq_cis; // (seq_len, head_size)
-
-    // Poor's man memory management
-    vector<void*> allocs;
-    size_t allocated_size = 0;
+    Array<2> freq_cis; // (seq_len, head_size);
 
     RunState(const Config&);
-   ~RunState() { for (void* d : allocs) free(d); }
-
-    float* alloc(size_t n) {
-        // We calloc instead of malloc to keep valgrind happy
-        void* d = calloc(n, sizeof(float));
-        if (!d) {
-            fprintf(stderr, "Cannot allocate run state!\n");
-            exit(EXIT_FAILURE);
-        }
-        allocated_size += n * sizeof(float);
-        allocs.push_back(d);
-        return static_cast<float*>(d);
-    }
 };
 
 RunState::RunState(const Config& p) {
@@ -148,19 +180,19 @@ RunState::RunState(const Config& p) {
     int head_size = p.dim / p.n_heads;
     size_t n_layers = size_t(p.n_layers); // ensure product is size_t
 
-    x   = alloc(p.dim);
-    xb  = alloc(p.dim);
-    xb2 = alloc(p.dim);
-    hb  = alloc(p.hidden_dim);
-    hb2 = alloc(p.hidden_dim);
-    q   = alloc(p.dim);
-    k   = alloc(p.dim);
-    v   = alloc(p.dim);
-    att = alloc(p.n_heads * p.seq_len);
-    logits      = alloc(p.vocab_size);
-    key_cache   = alloc(n_layers * p.seq_len * p.dim);
-    value_cache = alloc(n_layers * p.seq_len * p.dim);
-    freq_cis    = alloc(p.seq_len * head_size);
+    x.alloc(p.dim);
+    xb.alloc(p.n_heads, head_size); // dim = n_heads * head_size
+    xb2.alloc(p.dim);
+    hb.alloc(p.hidden_dim);
+    hb2.alloc(p.hidden_dim);
+    q.alloc(p.n_heads, head_size);  // dim
+    k.alloc(p.n_heads, head_size);  // dim
+    v.alloc(p.n_heads, head_size);  // dim
+    att.alloc(p.n_heads, p.seq_len);
+    logits.alloc(p.vocab_size);
+    key_cache.alloc(n_layers, p.seq_len, p.n_heads, head_size);
+    value_cache.alloc(n_layers, p.seq_len, p.n_heads, head_size);
+    freq_cis.alloc(p.seq_len, head_size);
 
     // Compute freq_cis, don't load from model.bin
     float* ptr = freq_cis;
@@ -391,7 +423,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     memcpy(x, content_row, dim * sizeof(float));
 
     // pluck out the "pos" row of freq_cis
-    float* fr = s->freq_cis + pos * head_size;
+    float* fr = s->freq_cis(pos);
 
     // forward all the layers
     for (int l = 0; l < p->n_layers; l++) {
@@ -408,30 +440,27 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         // rotate q and k by freq_cis in each head.
         int h;
         #pragma omp parallel for private(h)
-        for (h = 0; h < dim; h += 2) {
-            int k = h % head_size;
-            complexmul(s->q+h, s->q+h+1, fr[k], fr[k+1]);
-            complexmul(s->k+h, s->k+h+1, fr[k], fr[k+1]);
-        }
+        for (h = 0; h < p->n_heads; h++)
+            for (int i = 0; i < head_size; i += 2) {
+                complexmul(s->q(h)+i, s->q(h)+i+1, fr[i], fr[i+1]);
+                complexmul(s->k(h)+i, s->k(h)+i+1, fr[i], fr[i+1]);
+            }
 
         // save key,value at this time step (pos) to our kv cache
-        size_t loff = size_t(l) * p->seq_len * dim; // kv cache layer offset for convenience
-        float* key_cache_row = s->key_cache + loff + pos * dim;
-        float* value_cache_row = s->value_cache + loff + pos * dim;
-        memcpy(key_cache_row, s->k, dim * sizeof(float));
-        memcpy(value_cache_row, s->v, dim * sizeof(float));
+        memcpy(s->key_cache(l, pos), s->k, dim * sizeof(float));
+        memcpy(s->value_cache(l, pos), s->v, dim * sizeof(float));
 
         // multihead attention. iterate over all heads
         #pragma omp parallel for private(h)
         for (h = 0; h < p->n_heads; h++) {
             // get the query vector for this head
-            float* q = s->q + h * head_size;
+            float* q = s->q(h);
             // attention scores for this head
-            float* att = s->att + h * p->seq_len;
+            float* att = s->att(h);
             // iterate over all timesteps, including the current one
             for (int t = 0; t <= pos; t++) {
                 // get the key vector for this head and at this timestep
-                float* k = s->key_cache + loff + t * dim + h * head_size;
+                float* k = s->key_cache(l, t, h);
                 // calculate the attention score as the dot product of q and k
                 float score = 0.0f;
                 for (int i = 0; i < head_size; i++) {
@@ -447,11 +476,11 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
             softmax(att, pos + 1);
 
             // weighted sum of the values, store back into xb
-            float* xb = s->xb + h * head_size;
+            float* xb = s->xb(h);
             memset(xb, 0, head_size * sizeof(float));
             for (int t = 0; t <= pos; t++) {
                 // get the value vector for this head and at this timestep
-                float* v = s->value_cache + loff + t * dim + h * head_size;
+                float* v = s->value_cache(l, t, h);
                 // get the attention weight for this timestep
                 float a = att[t];
                 // accumulate the weighted value into xb
@@ -607,7 +636,7 @@ long run_model(int* steps, float temperature, float topp, int topk, const vector
     return time_in_ms() - start; // elapsed time in ms
 }
 
-void print_model_info(const Config& config, const RunState& state, vector<string>& vocab) {
+void print_model_info(const Config& config, vector<string>& vocab) {
     cerr << "\nModel parameters:\n"
          << "\n    Vocab size " << vocab.size()
          << "\n    Dimension " << config.dim
@@ -616,7 +645,6 @@ void print_model_info(const Config& config, const RunState& state, vector<string
          << "\n    Head size (dim / num heads) " << config.dim / config.n_heads
          << "\n    Num layers " << config.n_layers
          << "\n    Max context (tokens) " << config.seq_len
-         << "\n    Allocated memory (MB) " << state.allocated_size / (1024 * 1024)
          << "\n" << endl;
 }
 
@@ -681,7 +709,7 @@ int main(int argc, char* argv[]) {
     // Create and init the application RunState
     RunState state(config);
 
-    print_model_info(config, state, vocab);
+    print_model_info(config, vocab);
 
     // Process the prompt, if any
     vector<int> prompt_tokens;
