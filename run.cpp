@@ -38,8 +38,9 @@ class MMap {
     char* cur; // pointer arithmetic on void* is not standard
 
 public:
-    MMap(const char* file) {
+    MMap(const string& file_str) {
         struct stat fileInfo;
+        const char* file = file_str.c_str();
         int fd = open(file, O_RDONLY);
         if (fd == -1 || stat(file, &fileInfo) == -1) {
             fprintf(stderr, "Couldn't open file %s\n", file);
@@ -217,7 +218,7 @@ RunState::RunState(const Config& p) {
     }
 }
 
-void init_from_mmap(MMap& m, Config* p, TransformerWeights* w, vector<string>* vocab) {
+void init_from_mmap(MMap& m, MMap& t, Config* p, TransformerWeights* w, vector<string>* vocab) {
 
     // Read in config header, all Config fields are int32_t,
     // so define a union with an array to iterate over them
@@ -251,10 +252,8 @@ void init_from_mmap(MMap& m, Config* p, TransformerWeights* w, vector<string>* v
 
     w->wcls = shared_weights ? w->token_embedding_table : m.next(p->vocab_size * p->dim);
 
-    // Read in vocab
-    MMap t("tokenizer.bin");
+    // Read in the tokenizer .bin file
     t.next<float>(); // ignore max_token_length
-
     for (int i = 0; i < p->vocab_size; i++) {
         t.next<float>(); // ignore score
         int32_t len = *t.next<int32_t>();
@@ -666,14 +665,16 @@ void error_usage() {
             "  -k <int>    k value in top-k sampling. disabled by default, 0 = off\n"
             "  -s <int>    random seed, default time(NULL)\n"
             "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n"
-            "  -i <string> input prompt\n" << endl;
+            "  -i <string> input prompt\n"
+            "  -z <string> optional path to custom tokenizer\n" << endl;
     exit(EXIT_FAILURE);
 }
 
 int main(int argc, char* argv[]) {
 
     // default inits
-    char* checkpoint;         // e.g. out/model.bin
+    string checkpoint;         // e.g. out/model.bin
+    string tokenizer = "tokenizer.bin";
     float temperature = 1.0f; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 0.9f;        // top-p in nucleus sampling
     int topk = 0;             // top-k in Top-K sampling, disabled by default
@@ -686,7 +687,7 @@ int main(int argc, char* argv[]) {
     if (argc % 2 != 0)
         error_usage();
 
-    checkpoint = argv[1];
+    checkpoint = string(argv[1]);
 
     // Read in any optional argument
     if (argc > 2) {
@@ -698,6 +699,7 @@ int main(int argc, char* argv[]) {
             else if (opt[i] == "-s") RNG::seed = stoi(opt[i+1]);
             else if (opt[i] == "-n") steps = stoi(opt[i+1]);
             else if (opt[i] == "-i") prompt = opt[i+1];
+            else if (opt[i] == "-z") tokenizer = opt[i+1];
             else
                 error_usage();
         }
@@ -713,7 +715,8 @@ int main(int argc, char* argv[]) {
 
     // Memory map the checkpoint file and init weights
     MMap mmap(checkpoint);
-    init_from_mmap(mmap, &config, &weights, &vocab);
+    MMap tkmap(tokenizer);
+    init_from_mmap(mmap, tkmap, &config, &weights, &vocab);
 
     // Create and init the application RunState
     RunState state(config);
