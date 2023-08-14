@@ -174,8 +174,8 @@ struct RunState {
     Array<1> hb;  // buffer for hidden dimension in the ffn (hidden_dim,)
     Array<1> hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
     Array<2> q;   // query (dim,)
-    Array<2> k;   // key (dim,)
-    Array<2> v;   // value (dim,)
+    Array<2> k;   // key (kv_dim,)
+    Array<2> v;   // value (kv_dim,)
     Array<2> att; // buffer for scores/attention values (n_heads, seq_len)
     Array<1> logits; // output logits (vocab_size)
     // Key and Value cache
@@ -196,9 +196,9 @@ RunState::RunState(const Config& p) {
     xb2.alloc(p.dim);
     hb.alloc(p.hidden_dim);
     hb2.alloc(p.hidden_dim);
-    q.alloc(p.n_heads, head_size);  // dim
-    k.alloc(p.n_heads, head_size);  // dim
-    v.alloc(p.n_heads, head_size);  // dim
+    q.alloc(p.n_heads, head_size);
+    k.alloc(p.n_kv_heads, head_size);
+    v.alloc(p.n_kv_heads, head_size);
     att.alloc(p.n_heads, p.seq_len);
     logits.alloc(p.vocab_size);
     key_cache.alloc(p.n_layers, p.seq_len, p.n_kv_heads, head_size);
