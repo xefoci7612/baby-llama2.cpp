@@ -360,12 +360,6 @@ int sample(float* prob, int topk, float topp, int size) {
 // ----------------------------------------------------------------------------
 // neural net blocks
 
-void accum(float* a, float* b, int size) {
-    for (int i = 0; i < size; i++) {
-        a[i] += b[i];
-    }
-}
-
 void rmsnorm(float* o, float* x, float* w, int size) {
     // calculate sum of squares
     float ss = 0.0f;
@@ -502,7 +496,9 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         matmul(s->xb2, s->xb, w->wo(l), dim, dim);
 
         // residual connection back into x
-        accum(x, s->xb2, dim);
+        for (int i = 0; i < dim; i++) {
+            x[i] += s->xb2[i];
+        }
 
         // ffn rmsnorm
         rmsnorm(s->xb, x, w->rms_ffn_weight(l), dim);
@@ -526,7 +522,9 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         matmul(s->xb, s->hb, w->w2(l), hidden_dim, dim);
 
         // residual connection
-        accum(x, s->xb, dim);
+        for (int i = 0; i < dim; i++) {
+            x[i] += s->xb[i];
+        }
     }
 
     // final rmsnorm
@@ -673,14 +671,14 @@ void error_usage() {
 int main(int argc, char* argv[]) {
 
     // default inits
-    string checkpoint;         // e.g. out/model.bin
-    string tokenizer = "tokenizer.bin";
     float temperature = 1.0f; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 0.9f;        // top-p in nucleus sampling
     int topk = 0;             // top-k in Top-K sampling, disabled by default
     RNG::seed = 0;            // seed rng with time by default
     int steps = 256;          // max number of steps to run for, 0: use seq_len
     string prompt;            // prompt string
+    string checkpoint;        // e.g. out/model.bin
+    string tokenizer = "tokenizer.bin";
 
     // 'checkpoint' is necessary, optional arguments and their values
     // come in pairs, so argc must be even.
