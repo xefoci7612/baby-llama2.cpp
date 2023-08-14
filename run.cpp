@@ -307,17 +307,10 @@ int argmax(float* prob, int n) {
 // if topp and topk <= 0 simply sample from the predicted probability distribution
 int sample(float* prob, int topk, float topp, int size) {
 
-    static const float Threshold = 1e-5;
-
     auto greater_prob = [&prob](int a, int b) { return prob[a] > prob[b]; };
     vector<int> v;
     v.reserve(size);
     float cumulative_prob = 1.0f;
-
-    // Skip probabilities below threshold to speed up sorting
-    for (int i = 0; i < size; i++)
-        if (prob[i] >= Threshold)
-            v.push_back(i);
 
     if (topk > 0 && topk < (int)v.size()) {
         // move to front the topk indices with highest probability and resize
@@ -330,6 +323,13 @@ int sample(float* prob, int topk, float topp, int size) {
     }
 
     if (topp > 0 && topp < 1) {
+        // values smaller than (1 - topp) / (size - 1) cannot be part of the result
+        // so for efficiency we crop these out as candidates before sorting
+        const float cutoff = (1.0f - topp) / (size - 1);
+        for (int i = 0; i < size; i++)
+            if (prob[i] >= cutoff)
+                v.push_back(i);
+
         // sort in descending order of indexed probabilities
         sort(v.begin(), v.end(), greater_prob);
 
@@ -659,7 +659,7 @@ void error_usage() {
             "Example: run model.bin -n 256 -i \"Once upon a time\"\n"
             "Options:\n"
             "  -t <float>  temperature, default 1.0\n"
-            "  -p <float>  p value in top-p (nucleus) sampling. default 0.9, 0 = off\n"
+            "  -p <float>  p value in top-p (nucleus) sampling. default 0.9\n"
             "  -k <int>    k value in top-k sampling. disabled by default, 0 = off\n"
             "  -s <int>    random seed, default time(NULL)\n"
             "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n"
@@ -672,7 +672,7 @@ int main(int argc, char* argv[]) {
 
     // default inits
     float temperature = 1.0f; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
-    float topp = 0.9f;        // top-p in nucleus sampling
+    float topp = 0.9f;        // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
     int topk = 0;             // top-k in Top-K sampling, disabled by default
     RNG::seed = 0;            // seed rng with time by default
     int steps = 256;          // max number of steps to run for, 0: use seq_len
