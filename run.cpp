@@ -149,10 +149,10 @@ struct TransformerWeights {
     Array<2> rms_att_weight; // (layer, dim)
     Array<2> rms_ffn_weight; // (layer, dim)
     // weights for matmuls
-    Array<3> wq; // (layer, dim, dim)
-    Array<3> wk; // (layer, dim, dim)
-    Array<3> wv; // (layer, dim, dim)
-    Array<3> wo; // (layer, dim, dim)
+    Array<4> wq; // (layer, dim, n_heads, head_size)
+    Array<4> wk; // (layer, dim, n_kv_heads, head_size)
+    Array<4> wv; // (layer, dim, n_kv_heads, head_size)
+    Array<4> wo; // (layer, n_heads, head_size, dim)
     // weights for ffn
     Array<3> w1; // (layer, hidden_dim, dim)
     Array<3> w2; // (layer, dim, hidden_dim)
@@ -179,8 +179,8 @@ struct RunState {
     Array<2> att; // buffer for scores/attention values (n_heads, seq_len)
     Array<1> logits; // output logits (vocab_size)
     // Key and Value cache
-    Array<4> key_cache;   // (layer, seq_len, n_heads, head_size)
-    Array<4> value_cache; // (layer, seq_len, n_heads, head_size)
+    Array<4> key_cache;   // (layer, seq_len, n_kv_heads, head_size)
+    Array<4> value_cache; // (layer, seq_len, n_kv_heads, head_size)
     // freq_cis for RoPE relatively positional embeddings
     Array<2> freq_cis; // (seq_len, head_size);
 
@@ -201,8 +201,8 @@ RunState::RunState(const Config& p) {
     v.alloc(p.n_heads, head_size);  // dim
     att.alloc(p.n_heads, p.seq_len);
     logits.alloc(p.vocab_size);
-    key_cache.alloc(p.n_layers, p.seq_len, p.n_heads, head_size);
-    value_cache.alloc(p.n_layers, p.seq_len, p.n_heads, head_size);
+    key_cache.alloc(p.n_layers, p.seq_len, p.n_kv_heads, head_size);
+    value_cache.alloc(p.n_layers, p.seq_len, p.n_kv_heads, head_size);
     freq_cis.alloc(p.seq_len, head_size);
 
     // Compute freq_cis, don't load from model.bin
@@ -237,10 +237,10 @@ void init_from_mmap(MMap& m, MMap& t, Config* p, TransformerWeights* w, vector<s
 
     map_array(m, w->token_embedding_table, p->vocab_size, p->dim);
     map_array(m, w->rms_att_weight, p->n_layers, p->dim);
-    map_array(m, w->wq, p->n_layers, p->dim, p->dim);
-    map_array(m, w->wk, p->n_layers, p->dim, p->dim);
-    map_array(m, w->wv, p->n_layers, p->dim, p->dim);
-    map_array(m, w->wo, p->n_layers, p->dim, p->dim);
+    map_array(m, w->wq, p->n_layers, p->dim, p->n_heads, head_size);
+    map_array(m, w->wk, p->n_layers, p->dim, p->n_kv_heads, head_size);
+    map_array(m, w->wv, p->n_layers, p->dim, p->n_kv_heads, head_size);
+    map_array(m, w->wo, p->n_layers, p->n_heads, head_size, p->dim);
     map_array(m, w->rms_ffn_weight, p->n_layers, p->dim);
     map_array(m, w->w1, p->n_layers, p->hidden_dim, p->dim);
     map_array(m, w->w2, p->n_layers, p->dim, p->hidden_dim);
@@ -418,6 +418,8 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     // a few convenience variables
     float* x = s->x;
     int dim = p->dim;
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
     int hidden_dim =  p->hidden_dim;
     int head_size = dim / p->n_heads;
 
@@ -435,22 +437,25 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 
         // qkv matmuls for this position (V X M = V)
         matmul(s->q, s->xb, w->wq(l), dim, dim);
-        matmul(s->k, s->xb, w->wk(l), dim, dim);
-        matmul(s->v, s->xb, w->wv(l), dim, dim);
+        matmul(s->k, s->xb, w->wk(l), dim, kv_dim);
+        matmul(s->v, s->xb, w->wv(l), dim, kv_dim);
 
         // RoPE relative positional encoding: complex-valued
-        // rotate q and k by freq_cis
+        // rotate q and k by freq_cis in each head
         int h;
         #pragma omp parallel for private(h)
-        for (h = 0; h < p->n_heads; h++)
-            for (int i = 0; i < head_size; i += 2) {
-                complexmul(s->q(h)+i, s->q(h)+i+1, freq[i], freq[i+1]);
-                complexmul(s->k(h)+i, s->k(h)+i+1, freq[i], freq[i+1]);
-            }
+        for (h = 0; h < dim; h += 2) {
+            int k = (h % head_size);
+            complexmul(s->q+h, s->q+h+1, freq[k], freq[k+1]);
+        }
+        for (h = 0; h < kv_dim; h += 2) {
+            int k = (h % head_size);
+            complexmul(s->k+h, s->k+h+1, freq[k], freq[k+1]);
+        }
 
         // save key,value at this time step (pos) to our kv cache
-        memcpy(s->key_cache(l, pos), s->k, dim * sizeof(float));
-        memcpy(s->value_cache(l, pos), s->v, dim * sizeof(float));
+        memcpy(s->key_cache(l, pos), s->k, kv_dim * sizeof(float));
+        memcpy(s->value_cache(l, pos), s->v, kv_dim * sizeof(float));
 
         // multihead attention. iterate over all heads
         #pragma omp parallel for private(h)
@@ -462,7 +467,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
             // iterate over all timesteps, including the current one
             for (int t = 0; t <= pos; t++) {
                 // get the key vector for this head and at this timestep
-                float* k = s->key_cache(l, t, h);
+                float* k = s->key_cache(l, t, h / kv_mul);
                 // calculate the attention score as the dot product of q and k
                 float score = 0.0f;
                 for (int i = 0; i < head_size; i++) {
@@ -482,7 +487,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
             memset(xb, 0, head_size * sizeof(float));
             for (int t = 0; t <= pos; t++) {
                 // get the value vector for this head and at this timestep
-                float* v = s->value_cache(l, t, h);
+                float* v = s->value_cache(l, t, h / kv_mul);
                 // get the attention weight for this timestep
                 float a = att[t];
                 // accumulate the weighted value into xb
@@ -648,6 +653,7 @@ void print_model_info(const Config& config, vector<string>& vocab) {
          << "\n    Dimension " << config.dim
          << "\n    Hidden dim " << config.dim
          << "\n    Num heads " << config.n_heads
+         << "\n    Num kv heads " << config.n_kv_heads
          << "\n    Head size (dim / num heads) " << config.dim / config.n_heads
          << "\n    Num layers " << config.n_layers
          << "\n    Max context (tokens) " << config.seq_len
