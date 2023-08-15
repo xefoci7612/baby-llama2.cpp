@@ -555,10 +555,18 @@ void bpe_encode(vector<int>* tokens_ptr, const string& text, const vector<string
     tokens.push_back(str_lookup(" ", sorted_vocab));
 
     // first encode every individual character in the input (UTF-8) string
-    for (size_t i = 0, start = 0; i < text.size(); start = i) {
+    for (size_t i = 0; i < text.size(); ) {
+
+        // find the [start, end) of the current UTF-8 character
+        int start = i;
+
         // in a UTF-8 character any byte but the first has format 10xxxxxx
-        while ((text[++i] & 0xc0) == 0x80) {}
-        str = text.substr(start, i - start); // extract a single UTF-8 char
+        do {
+            i++;
+        } while (i < text.size() && (text[i] & 0xC0) == 0x80);
+
+        // extract the UTF-8 character and look up it in the vocabulary
+        str = text.substr(start, i - start);
         int id = str_lookup(str, sorted_vocab);
         if (id != -1) {
             // we found this codepoint in vocab, add it as a token
@@ -600,8 +608,8 @@ void bpe_encode(vector<int>* tokens_ptr, const string& text, const vector<string
         sv[best_idx] = -1e10; // reset stale score
 
         // update scores at previous and current position
-        start = max(best_idx - 1, 0);
-        end = min(best_idx + 1, (int)sv.size() - 1);
+        start = std::max(best_idx - 1, 0);
+        end = std::min(best_idx + 1, static_cast<int>(sv.size()) - 1);
     }
 }
 
