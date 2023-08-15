@@ -9,6 +9,7 @@ $ ./run
 */
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +17,7 @@ $ ./run
 #include <ctime>
 #include <fcntl.h>
 #include <iostream>
+#include <map>
 #include <vector>
 #include <sys/stat.h>
 
@@ -541,28 +543,39 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 // ----------------------------------------------------------------------------
 // byte pair encoding (BPE) tokenizer, encodes strings into tokens so we can prompt
 
-int str_lookup(const string& str, const vector<string>& vocab) {
+int str_lookup(const string& str, const map<string, int>& sorted_vocab) {
 
-    auto it = find(vocab.begin(), vocab.end(), str);
-    return it != vocab.end() ? it - vocab.begin() : -1;
+    auto it = sorted_vocab.find(str);
+    return it != sorted_vocab.end() ? it->second : -1;
 }
 
 void bpe_encode(vector<int>* tokens_ptr, const string& text, const vector<string>& vocab) {
 
     vector<int>& tokens = *tokens_ptr; // syntactic sugar
+    map<string, int> sorted_vocab;
     string str;
 
-    // First encode every individual character in the input string
+    // sort vocabulary
+    for (size_t i = 0; i < vocab.size(); i++)
+        sorted_vocab[vocab[i]] = i;
+
+    // first encode every individual character in the input (UTF-8) string
     for (size_t i = 0, start = 0; i < text.size(); start = i) {
-        // In UTF-8 character any byte but the first has format 10xxxxxx
+        // in a UTF-8 character any byte but the first has format 10xxxxxx
         while ((text[++i] & 0xc0) == 0x80) {}
-        str = text.substr(start, i - start);
-        int id = str_lookup(str, vocab);
-        if (id == -1) {
-            cerr << "Character <" << str << "> not in vocab" << endl;
-            exit(EXIT_FAILURE);
+        str = text.substr(start, i - start); // extract a single UTF-8 char
+        int id = str_lookup(str, sorted_vocab);
+        if (id != -1) {
+            // we found this codepoint in vocab, add it as a token
+            tokens.push_back(id);
+        } else {
+            // byte_fallback encoding: just encode each byte as a token
+            // +3 is here because the first 3 vocab elements are <unk>, <s>, </s>
+            // so the individual bytes only start at index 3
+            for (unsigned char c : str) {
+                tokens.push_back(c + 3);
+            }
         }
-        tokens.push_back(id);
     }
 
     // Greedy merge consecutive tokens until there are no more new merges
@@ -571,7 +584,7 @@ void bpe_encode(vector<int>* tokens_ptr, const string& text, const vector<string
         for (size_t next = i + 1; next < tokens.size(); next++) {
             // check if we can merge the pair (token[i], token[next])
             str = vocab[tokens[i]] + vocab[tokens[next]];
-            int id = str_lookup(str, vocab);
+            int id = str_lookup(str, sorted_vocab);
             if (id == -1)
                 tokens[++i] = tokens[next]; // can't merge further, move to next
             else
@@ -633,6 +646,15 @@ long run_model(int* steps, float temperature, float topp, int topk, const vector
         string next_str = vocab[next];
         if (token == BOS && next_str[0] == ' ')
             next_str.erase(0, 1);
+
+        // careful, some tokens designate raw bytes, and look like e.g. '<0x01>'
+        unsigned char byte_val;
+        if (sscanf(next_str.c_str(), "<0x%02hhX>", &byte_val) == 1) {
+            // ok this token is a raw byte token, carefuly to only print printable chars or whitespace
+            // some of the other bytes can be various control codes, backspace, etc. => skip
+            if (isprint(byte_val) || isspace(byte_val))
+                next_str = string(1, byte_val);
+        }
 
         cout << next_str << std::flush;
         token = next;
