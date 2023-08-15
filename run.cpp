@@ -572,31 +572,36 @@ void bpe_encode(vector<int>* tokens_ptr, const string& text, const vector<string
         }
     }
 
-    // merge the best consecutive pair each iteration, according the scores in vocab_scores
-    while (true) {
-        float best_score = -1e10;
-        int best_id = -1;
-        int best_idx = -1;
+    vector<float> sv(tokens.size(), -1e10);
+    int start = 0;
+    int end = sv.size() - 1;
 
-        for (size_t i = 0; i < tokens.size() - 1; i++) {
-            // check if we can merge the pair (tokens[i], tokens[i+1])
+    while (true) {
+
+        // find all possible merges between two consecutive tokens in [start, end)
+        for (int i = start; i < end; i++) {
             str = vocab[tokens[i]] + vocab[tokens[i+1]];
             int id = str_lookup(str, sorted_vocab);
-            if (id != -1 && vocab_scores[id] > best_score) {
-                // this merge pair exists in vocab! record its score and position
-                best_score = vocab_scores[id];
-                best_id = id;
-                best_idx = i;
-            }
+            sv[i] = (id != -1 ? vocab_scores[id] : -1e10);
         }
+        // pick the best one with the highest score
+        int best_idx = argmax(sv.data(), sv.size());
 
-        if (best_idx == -1)
+        if (sv[best_idx] <= -1e10)
             break; // we couldn't find any more pairs to merge, so we're done
 
-        // merge the consecutive pair (best_idx, best_idx+1) into new token best_id
-        tokens[best_idx] = best_id;
+        // merge the consecutive pair (best_idx, best_idx+1) into a new token
+        str = vocab[tokens[best_idx]] + vocab[tokens[best_idx+1]];
+        tokens[best_idx] = str_lookup(str, sorted_vocab);
+
         // delete token at position best_idx+1, shift the entire sequence back 1
         tokens.erase(tokens.begin() + best_idx + 1);
+        sv.erase(sv.begin() + best_idx + 1);
+        sv[best_idx] = -1e10; // reset stale score
+
+        // update scores at previous and current position
+        start = max(best_idx - 1, 0);
+        end = min(best_idx + 1, (int)sv.size() - 1);
     }
 }
 
