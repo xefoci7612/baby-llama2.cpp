@@ -45,12 +45,12 @@ public:
         const char* file = file_str.c_str();
         int fd = open(file, O_RDONLY);
         if (fd == -1 || stat(file, &fileInfo) == -1) {
-            fprintf(stderr, "Couldn't open file %s\n", file);
+            cerr << "Couldn't open file " << file_str << endl;
             exit(EXIT_FAILURE);
         }
         data = mmap(NULL, fileInfo.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
         if (data == MAP_FAILED) {
-            fprintf(stderr, "mmap failed!\n");
+            cerr << "mmap failed!" << endl;
             exit(EXIT_FAILURE);
         }
         cur = static_cast<char*>(data);
@@ -64,7 +64,7 @@ public:
         T* ptr = reinterpret_cast<T*>(cur);
         cur += n * sizeof(T);
         if (cur > (char*)data + size) {
-            fprintf(stderr, "Mapping after end of file!\n");
+            cerr << "Mapping after end of file!" << endl;
             exit(EXIT_FAILURE);
         }
         return ptr;
@@ -92,7 +92,7 @@ struct Array<1> {
             // we calloc instead of malloc to keep valgrind happy
             base = (float*)calloc(n, sizeof(float));
             if (!base) {
-                fprintf(stderr, "Cannot allocate run state!\n");
+                cerr << "Cannot allocate run state!" << endl;
                 exit(EXIT_FAILURE);
             }
         }
@@ -748,7 +748,7 @@ int main(int argc, char* argv[]) {
 
     // report achieved tok/s (steps-1 because the timer starts after first iteration)
     if (steps > 1)
-        fprintf(stderr, "\nachieved tok/s: %f\n", (steps-1) / (double)(elapsed)*1000);
+        cerr << "\nachieved tok/s: " << (steps-1) / (double)(elapsed)*1000 << endl;
 
     return 0;
 }
