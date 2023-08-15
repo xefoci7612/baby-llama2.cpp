@@ -220,7 +220,8 @@ RunState::RunState(const Config& p) {
     }
 }
 
-void init_from_mmap(MMap& m, MMap& t, Config* p, TransformerWeights* w, vector<string>* vocab) {
+void init_from_mmap(MMap& m, MMap& t, Config* p, TransformerWeights* w,
+                    vector<string>* vocab, vector<float>* vocab_scores) {
 
     // Read in config header, all Config fields are int32_t,
     // so define a union with an array to iterate over them
@@ -256,10 +257,11 @@ void init_from_mmap(MMap& m, MMap& t, Config* p, TransformerWeights* w, vector<s
     // Read in the tokenizer .bin file
     t.next<float>(); // ignore max_token_length
     for (int i = 0; i < p->vocab_size; i++) {
-        t.next<float>(); // ignore score
+        float score = *t.next<float>();
         int32_t len = *t.next<int32_t>();
         char* c = t.next<char>(len);
         vocab->push_back(string(c, len));
+        vocab_scores->push_back(score);
     }
 }
 
@@ -539,7 +541,7 @@ int str_lookup(const string& str, const map<string, int>& sorted_vocab) {
     return it != sorted_vocab.end() ? it->second : -1;
 }
 
-void bpe_encode(vector<int>* tokens_ptr, const string& text, const vector<string>& vocab) {
+void bpe_encode(vector<int>* tokens_ptr, const string& text, const vector<string>& vocab, const vector<float>& vocab_scores) {
 
     vector<int>& tokens = *tokens_ptr; // syntactic sugar
     map<string, int> sorted_vocab;
@@ -548,6 +550,9 @@ void bpe_encode(vector<int>* tokens_ptr, const string& text, const vector<string
     // sort vocabulary
     for (size_t i = 0; i < vocab.size(); i++)
         sorted_vocab[vocab[i]] = i;
+
+    // add_dummy_prefix is true by default
+    tokens.push_back(str_lookup(" ", sorted_vocab));
 
     // first encode every individual character in the input (UTF-8) string
     for (size_t i = 0, start = 0; i < text.size(); start = i) {
@@ -562,27 +567,36 @@ void bpe_encode(vector<int>* tokens_ptr, const string& text, const vector<string
             // byte_fallback encoding: just encode each byte as a token
             // +3 is here because the first 3 vocab elements are <unk>, <s>, </s>
             // so the individual bytes only start at index 3
-            for (unsigned char c : str) {
+            for (unsigned char c : str)
                 tokens.push_back(c + 3);
-            }
         }
     }
 
-    // Greedy merge consecutive tokens until there are no more new merges
+    // merge the best consecutive pair each iteration, according the scores in vocab_scores
     while (true) {
-        size_t i = 0;
-        for (size_t next = i + 1; next < tokens.size(); next++) {
-            // check if we can merge the pair (token[i], token[next])
-            str = vocab[tokens[i]] + vocab[tokens[next]];
+        float best_score = -1e10;
+        int best_id = -1;
+        int best_idx = -1;
+
+        for (size_t i = 0; i < tokens.size() - 1; i++) {
+            // check if we can merge the pair (tokens[i], tokens[i+1])
+            str = vocab[tokens[i]] + vocab[tokens[i+1]];
             int id = str_lookup(str, sorted_vocab);
-            if (id == -1)
-                tokens[++i] = tokens[next]; // can't merge further, move to next
-            else
-                tokens[i] = id; // merge next token
+            if (id != -1 && vocab_scores[id] > best_score) {
+                // this merge pair exists in vocab! record its score and position
+                best_score = vocab_scores[id];
+                best_id = id;
+                best_idx = i;
+            }
         }
-        if (tokens.size() == i+1)
-            break; // no new merges in the last iteration
-        tokens.resize(i+1);
+
+        if (best_idx == -1)
+            break; // we couldn't find any more pairs to merge, so we're done
+
+        // merge the consecutive pair (best_idx, best_idx+1) into new token best_id
+        tokens[best_idx] = best_id;
+        // delete token at position best_idx+1, shift the entire sequence back 1
+        tokens.erase(tokens.begin() + best_idx + 1);
     }
 }
 
@@ -722,11 +736,12 @@ int main(int argc, char* argv[]) {
     Config config;
     TransformerWeights weights;
     vector<string> vocab;
+    vector<float> vocab_scores;
 
     // Memory map the checkpoint file and init weights
     MMap mmap(checkpoint);
     MMap tkmap(tokenizer);
-    init_from_mmap(mmap, tkmap, &config, &weights, &vocab);
+    init_from_mmap(mmap, tkmap, &config, &weights, &vocab, &vocab_scores);
 
     // Create and init the application RunState
     RunState state(config);
@@ -736,7 +751,7 @@ int main(int argc, char* argv[]) {
     // Process the prompt, if any
     vector<int> prompt_tokens;
     if (!prompt.empty())
-        bpe_encode(&prompt_tokens, prompt, vocab);
+        bpe_encode(&prompt_tokens, prompt, vocab, vocab_scores);
 
     // Right now we cannot run for more than config.seq_len steps
     if (steps <= 0 || steps > config.seq_len)
