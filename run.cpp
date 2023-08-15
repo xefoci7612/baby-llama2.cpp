@@ -641,8 +641,7 @@ long run_model(int* steps, float temperature, float topp, const vector<int>& pro
         if (sscanf(next_str.c_str(), "<0x%02hhX>", &byte_val) == 1) {
             // ok this token is a raw byte token, carefuly to only print printable chars or whitespace
             // some of the other bytes can be various control codes, backspace, etc. => skip
-            if (isprint(byte_val) || isspace(byte_val))
-                next_str = string(1, byte_val);
+            next_str = isprint(byte_val) || isspace(byte_val) ? string(1, byte_val) : "";
         }
 
         cout << next_str << std::flush;
