@@ -291,7 +291,7 @@ namespace RNG {
 };
 
 // ----------------------------------------------------------------------------
-// sampling can be done in a few ways: greedy argmax, sampling, top-p or top-k sampling
+// sampling can be done in a few ways: greedy argmax, sampling or top-p sampling
 
 int argmax(float* prob, int n) {
     // return the index with the highest probability
@@ -302,37 +302,27 @@ int argmax(float* prob, int n) {
 // tokens that exceed probability topp. This way we never sample tokens that
 // have very low probabilities and are less likely to go "off the rails".
 //
-// top-k sampling samples from the set of k tokens with the highest probabilities.
-// If enabled, top-k will be performed before top-p.
-//
-// if topp and topk <= 0 simply sample from the predicted probability distribution
-int sample(float* prob, int topk, float topp, int n) {
+// if topp <= 0 or > 1 simply sample from the predicted probability distribution
+int sample(float* prob, float topp, int n) {
 
-    auto greater_prob = [prob](int a, int b) { return prob[a] > prob[b]; };
     vector<int> v;
     v.reserve(n);
     float cumulative_prob = 1.0f;
 
-    if (topk > 0 && topk < (int)v.size()) {
-        // move to front the topk indices with highest probability and resize
-        nth_element(v.begin(), v.begin() + topk, v.end(), greater_prob);
-        v.resize(topk);
-        // normalize probabilities so that sum is 1
-        float sum = 0.0f;
-        for (int i : v) { sum += prob[i]; }
-        for (int i : v) { prob[i] /= sum; }
+    if (topp <= 0 || topp > 1)
+        topp = 1.0f;
+
+    // values smaller than (1 - topp) / (n - 1) cannot be part of the result
+    // so for efficiency we crop these out as candidates before sorting
+    const float cutoff = (1.0f - topp) / (n - 1);
+    for (int i = 0; i < n; i++) {
+        if (prob[i] >= cutoff)
+            v.push_back(i);
     }
 
-    if (topp > 0 && topp < 1) {
-        // values smaller than (1 - topp) / (n - 1) cannot be part of the result
-        // so for efficiency we crop these out as candidates before sorting
-        const float cutoff = (1.0f - topp) / (n - 1);
-        for (int i = 0; i < n; i++) {
-            if (prob[i] >= cutoff)
-                v.push_back(i);
-        }
+    if (topp < 1) {
         // sort in descending order of indexed probabilities
-        sort(v.begin(), v.end(), greater_prob);
+        sort(v.begin(), v.end(), [prob](int a, int b) { return prob[a] > prob[b]; });
 
         // truncate the list where cumulative probability exceeds topp
         cumulative_prob = 0.0f;
@@ -599,7 +589,7 @@ void bpe_encode(vector<int>* tokens_ptr, const string& text, const vector<string
 // ----------------------------------------------------------------------------
 // main loop, runs model inference
 
-long run_model(int* steps, float temperature, float topp, int topk, const vector<int>& prompt_tokens,
+long run_model(int* steps, float temperature, float topp, const vector<int>& prompt_tokens,
                RunState& state, Config& config, TransformerWeights& weights, const vector<string>& vocab) {
 
     static const int BOS = 1; // BOS token
@@ -629,10 +619,9 @@ long run_model(int* steps, float temperature, float topp, int topk, const vector
                 softmax(state.logits, config.vocab_size, temperature);
 
                 // sample from this distribution to get the next token
-                // if topk > 0 we perform top-k sampling, sampling among the top k tokens,
                 // if topp > 0 we (also) perform top-p (nucleus) sampling, clamping the least likely
                 // tokens to zero. Othewise sample from the predicted probability distribution.
-                next = sample(state.logits, topk, topp, config.vocab_size);
+                next = sample(state.logits, topp, config.vocab_size);
             }
         }
 
@@ -687,7 +676,6 @@ void error_usage() {
             "Options:\n"
             "  -t <float>  temperature, default 1.0\n"
             "  -p <float>  p value in top-p (nucleus) sampling. default 0.9\n"
-            "  -k <int>    k value in top-k sampling. disabled by default, 0 = off\n"
             "  -s <int>    random seed, default time(NULL)\n"
             "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n"
             "  -i <string> input prompt\n"
@@ -700,7 +688,6 @@ int main(int argc, char* argv[]) {
     // default inits
     float temperature = 1.0f; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 0.9f;        // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
-    int topk = 0;             // top-k in Top-K sampling, disabled by default
     RNG::seed = 0;            // seed rng with time by default
     int steps = 256;          // max number of steps to run for, 0: use seq_len
     string prompt;            // prompt string
@@ -720,7 +707,6 @@ int main(int argc, char* argv[]) {
         for (size_t i = 0; i < opt.size(); i += 2) {
             if      (opt[i] == "-t") temperature = stof(opt[i+1]);
             else if (opt[i] == "-p") topp = stof(opt[i+1]);
-            else if (opt[i] == "-k") topk = stoi(opt[i+1]);
             else if (opt[i] == "-s") RNG::seed = stoi(opt[i+1]);
             else if (opt[i] == "-n") steps = stoi(opt[i+1]);
             else if (opt[i] == "-i") prompt = opt[i+1];
@@ -758,7 +744,7 @@ int main(int argc, char* argv[]) {
         steps = config.seq_len;
 
     // Run the model for the given number of steps or until BOS token
-    long elapsed = run_model(&steps, temperature, topp, topk, prompt_tokens, state, config, weights, vocab);
+    long elapsed = run_model(&steps, temperature, topp, prompt_tokens, state, config, weights, vocab);
 
     // report achieved tok/s (steps-1 because the timer starts after first iteration)
     if (steps > 1)
