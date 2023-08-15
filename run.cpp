@@ -2,29 +2,29 @@
 Inference for Llama-2 Transformer model in C/C++
 
 Example compile: (see README for more details)
-$ g++ -O3 -o run run.cpp -lm
+$ g++ -O3 -o run run.cpp
 
 Then run with:
 $ ./run
 */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <time.h>
-#include <math.h>
-#include <string.h>
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
 #include <fcntl.h>
+#include <iostream>
+#include <vector>
+#include <sys/stat.h>
+
 #if defined _WIN32
     #include "win.h"
 #else
     #include <unistd.h>
     #include <sys/mman.h>
 #endif
-
-#include <algorithm>
-#include <iostream>
-#include <vector>
-#include <sys/stat.h>
 
 using namespace std;
 
@@ -61,7 +61,7 @@ public:
     T* next(size_t n = 1) {
         T* ptr = reinterpret_cast<T*>(cur);
         cur += n * sizeof(T);
-        if (cur > (char*)(data) + size) {
+        if (cur > (char*)data + size) {
             fprintf(stderr, "Mapping after end of file!\n");
             exit(EXIT_FAILURE);
         }
@@ -70,7 +70,7 @@ public:
 };
 
 // ----------------------------------------------------------------------------
-// A dynamic multi-dimensional array M(x,y) -> &M[x][y], M(x) -> M[x]
+// A dynamic multi-dimensional array M(x,y) -> &M[x][y], M(x) -> M[x][...]
 
 template <size_t N> struct Array;
 
@@ -104,7 +104,7 @@ struct Array<1> {
 template<typename... Args>
 size_t argmul(Args... args) { return (size_t(1) * ... * args); }
 
-// Helper to map a file into an Array
+// Helper to map an Array into a memory mapped file
 template<size_t N, typename... Args>
 void map_array(MMap& m, Array<N>& a, Args... args) {
     a.base = m.next(argmul(args...));
@@ -192,7 +192,7 @@ RunState::RunState(const Config& p) {
     int head_size = p.dim / p.n_heads;
 
     x.alloc(p.dim);
-    xb.alloc(p.n_heads, head_size); // dim = n_heads * head_size
+    xb.alloc(p.n_heads, head_size); // dim == n_heads * head_size
     xb2.alloc(p.dim);
     hb.alloc(p.hidden_dim);
     hb2.alloc(p.hidden_dim);
@@ -205,7 +205,7 @@ RunState::RunState(const Config& p) {
     value_cache.alloc(p.n_layers, p.seq_len, p.n_kv_heads, head_size);
     freq_cis.alloc(p.seq_len, head_size);
 
-    // Compute freq_cis, don't load from model.bin
+    // Compute freq_cis
     float* ptr = freq_cis;
     float theta = 1e+08;
     for (int pos = 0; pos < p.seq_len; pos++) {
@@ -222,11 +222,10 @@ void init_from_mmap(MMap& m, MMap& t, Config* p, TransformerWeights* w, vector<s
 
     // Read in config header, all Config fields are int32_t,
     // so define a union with an array to iterate over them
-    static const int N = sizeof(Config) / sizeof(int32_t);
+    static const size_t N = sizeof(Config) / sizeof(int32_t);
     union U { struct Config; int32_t vec[N]; };
-    int32_t* v = reinterpret_cast<U*>(p)->vec;
-    for (int i = 0; i < N; i++)
-        v[i] = *m.next<int32_t>();
+    for (auto& v : reinterpret_cast<U*>(p)->vec)
+        v = *m.next<int32_t>();
 
     // Negative vocab size is hacky way of signaling unshared weights. bit yikes.
     bool shared_weights = (p->vocab_size > 0);
@@ -274,7 +273,7 @@ long time_in_ms() {
 
 namespace RNG {
 
-    unsigned long long seed; // Should be set before use, cannot be 0
+    unsigned long long seed; // should be set before use, cannot be 0
 
     unsigned int random_u32() {
         // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
@@ -293,7 +292,7 @@ namespace RNG {
 // sampling can be done in a few ways: greedy argmax, sampling, top-p or top-k sampling
 
 int argmax(float* prob, int n) {
-    // return the index that has the highest probability
+    // return the index with the highest probability
     return std::distance(prob, max_element(prob, prob + n));
 }
 
@@ -301,15 +300,15 @@ int argmax(float* prob, int n) {
 // tokens that exceed probability topp. This way we never sample tokens that
 // have very low probabilities and are less likely to go "off the rails".
 //
-// top-k sampling samples from the K set of tokens with the highest probabities.
+// top-k sampling samples from the set of k tokens with the highest probabilities.
 // If enabled, top-k will be performed before top-p.
 //
 // if topp and topk <= 0 simply sample from the predicted probability distribution
-int sample(float* prob, int topk, float topp, int size) {
+int sample(float* prob, int topk, float topp, int n) {
 
-    auto greater_prob = [&prob](int a, int b) { return prob[a] > prob[b]; };
+    auto greater_prob = [prob](int a, int b) { return prob[a] > prob[b]; };
     vector<int> v;
-    v.reserve(size);
+    v.reserve(n);
     float cumulative_prob = 1.0f;
 
     if (topk > 0 && topk < (int)v.size()) {
@@ -317,19 +316,19 @@ int sample(float* prob, int topk, float topp, int size) {
         nth_element(v.begin(), v.begin() + topk, v.end(), greater_prob);
         v.resize(topk);
         // normalize probabilities so that sum is 1
-        float sum = 0.0;
+        float sum = 0.0f;
         for (int i : v) { sum += prob[i]; }
         for (int i : v) { prob[i] /= sum; }
     }
 
     if (topp > 0 && topp < 1) {
-        // values smaller than (1 - topp) / (size - 1) cannot be part of the result
+        // values smaller than (1 - topp) / (n - 1) cannot be part of the result
         // so for efficiency we crop these out as candidates before sorting
-        const float cutoff = (1.0f - topp) / (size - 1);
-        for (int i = 0; i < size; i++)
+        const float cutoff = (1.0f - topp) / (n - 1);
+        for (int i = 0; i < n; i++) {
             if (prob[i] >= cutoff)
                 v.push_back(i);
-
+        }
         // sort in descending order of indexed probabilities
         sort(v.begin(), v.end(), greater_prob);
 
@@ -375,7 +374,7 @@ void rmsnorm(float* o, float* x, float* w, int size) {
     }
 }
 
-void softmax(float* x, int size, float temperature = 1.0) {
+void softmax(float* x, int size, float temperature = 1.0f) {
     // find max value (for numerical stability)
     int id = argmax(x, size);
     float max_val = x[id];
