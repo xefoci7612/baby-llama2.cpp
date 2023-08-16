@@ -440,10 +440,9 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         for (h = 0; h < dim; h += 2) {
             int k = (h % head_size);
             complexmul(s->q+h, s->q+h+1, freq[k], freq[k+1]);
-        }
-        for (h = 0; h < kv_dim; h += 2) {
-            int k = (h % head_size);
-            complexmul(s->k+h, s->k+h+1, freq[k], freq[k+1]);
+            if (h < kv_dim) {
+                complexmul(s->k+h, s->k+h+1, freq[k], freq[k+1]);
+            }
         }
 
         // save key,value at this time step (pos) to our kv cache
@@ -558,14 +557,14 @@ void bpe_encode(vector<int>* tokens_ptr, const string& text, const vector<string
     for (size_t i = 0; i < text.size(); ) {
 
         // find the [start, end) of the current UTF-8 character
-        int start = i;
+        size_t start = i;
 
         // in a UTF-8 character any byte but the first has format 10xxxxxx
         do {
             i++;
         } while (i < text.size() && (text[i] & 0xC0) == 0x80);
 
-        // extract the UTF-8 character and look up it in the vocabulary
+        // extract the UTF-8 character and look it up in the vocabulary
         str = text.substr(start, i - start);
         int id = str_lookup(str, sorted_vocab);
         if (id != -1) {
