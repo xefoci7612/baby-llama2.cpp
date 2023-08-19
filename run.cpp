@@ -1,12 +1,4 @@
-/*
-Inference for Llama-2 Transformer model in C/C++
-
-Example compile: (see README for more details)
-$ g++ -O3 -o run run.cpp
-
-Then run with:
-$ ./run
-*/
+/* Inference for Llama-2 Transformer model in pure C/C++ */
 
 #include <algorithm>
 #include <cctype>
@@ -183,7 +175,7 @@ struct RunState {
     // Key and Value cache
     Array<4> key_cache;   // (layer, seq_len, n_kv_heads, head_size)
     Array<4> value_cache; // (layer, seq_len, n_kv_heads, head_size)
-    // freq_cis for RoPE relatively positional embeddings
+    // freq_cis for RoPE relatively positional embeddings (not used anymore)
     Array<2> freq_cis; // (seq_len, head_size);
 
     RunState(const Config&);
@@ -209,13 +201,12 @@ RunState::RunState(const Config& p) {
 
     // Compute freq_cis
     float* ptr = freq_cis;
-    float theta = 1e+08;
     for (int pos = 0; pos < p.seq_len; pos++) {
-        for (int i = 0; i < head_size / 2; i++) {
-            float freq = 1.0 / pow(theta, float(i) / head_size);
+        for (int i = 0; i < head_size; i += 2) {
+            float freq = 1.0f / powf(10000.0f, float(i) / head_size);
             freq *= pos;
-            *ptr++ = cos(freq); // real part
-            *ptr++ = sin(freq); // imaginary part
+            *ptr++ = cosf(freq); // real part
+            *ptr++ = sinf(freq); // imaginary part
         }
     }
 }
