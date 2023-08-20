@@ -607,10 +607,13 @@ void bpe_encode(vector<int>* tokens_ptr, const string& text, const vector<string
 // ----------------------------------------------------------------------------
 // main loop, runs model inference
 
-long run_model(int* steps, float temperature, float topp, const vector<int>& prompt_tokens,
+long run_model(int* steps, float temperature, float topp, int colour, const vector<int>& prompt_tokens,
                RunState& state, Config& config, TransformerWeights& weights, const vector<string>& vocab) {
 
     static const int BOS = 1; // BOS token
+
+    // ANSI color codes: red, orange, yellow, light green, default
+    const vector<string> Colors({ "\033[31m", "\033[38;5;208m", "\033[38;5;226m", "\033[38;5;118m", "" });
 
     long start = 0;  // used to time our code, only initialized after first iteration
     int next;        // will store the next token in the sequence
@@ -662,6 +665,11 @@ long run_model(int* steps, float temperature, float topp, const vector<int>& pro
             next_str = isprint(byte_val) || isspace(byte_val) ? string(1, byte_val) : "";
         }
 
+        // assign ANSI colour to token if colour option is set
+        float prob = state.logits[next];
+        if (colour && prob > 0 && prob < 1)
+            next_str = Colors[int(prob * 5)] + next_str + "\033[0m";
+
         cout << next_str << std::flush;
         token = next;
 
@@ -695,6 +703,7 @@ void error_usage() {
             "  -p <float>  p value in top-p (nucleus) sampling. default 0.9\n"
             "  -s <int>    random seed, default time(NULL)\n"
             "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n"
+            "  -c <bool>   colour the probability of the next token, default 0 (false)\n"
             "  -i <string> input prompt\n"
             "  -z <string> optional path to custom tokenizer\n" << endl;
     exit(EXIT_FAILURE);
@@ -707,6 +716,7 @@ int main(int argc, char* argv[]) {
     float topp = 0.9f;        // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
     RNG::seed = 0;            // seed rng with time by default
     int steps = 256;          // max number of steps to run for, 0: use seq_len
+    int colour = 0;           // colour the prompt based on there logistic probability
     string prompt;            // prompt string
     string checkpoint;        // e.g. out/model.bin
     string tokenizer = "tokenizer.bin";
@@ -726,6 +736,7 @@ int main(int argc, char* argv[]) {
             else if (opt[i] == "-p") topp = stof(opt[i+1]);
             else if (opt[i] == "-s") RNG::seed = stoi(opt[i+1]);
             else if (opt[i] == "-n") steps = stoi(opt[i+1]);
+            else if (opt[i] == "-c") colour = stoi(opt[i+1]);
             else if (opt[i] == "-i") prompt = opt[i+1];
             else if (opt[i] == "-z") tokenizer = opt[i+1];
             else
@@ -762,7 +773,7 @@ int main(int argc, char* argv[]) {
         steps = config.seq_len;
 
     // Run the model for the given number of steps or until BOS token
-    long elapsed = run_model(&steps, temperature, topp, prompt_tokens, state, config, weights, vocab);
+    long elapsed = run_model(&steps, temperature, topp, colour, prompt_tokens, state, config, weights, vocab);
 
     // report achieved tok/s (steps-1 because the timer starts after first iteration)
     if (steps > 1)
