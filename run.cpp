@@ -77,7 +77,8 @@ struct Array<1> {
     operator float*() const { return base; }
 
     // return a pointer to the indexed item
-    float* operator()(size_t x) { return base + x; }
+    size_t addr(size_t x) { return x; } // used by derived classes
+    float* operator()(size_t x) { return base + addr(x); }
 
     void alloc(size_t n) {
         if (!mem_mapped) {
