@@ -22,6 +22,8 @@
 
 using namespace std;
 
+static const int BOS = 1; // BOS token
+
 // ----------------------------------------------------------------------------
 // Memory mapping facility to load model and tokenizer files
 
@@ -99,14 +101,6 @@ struct Array<1> {
 template<typename... Args>
 size_t argmul(Args... args) { return (size_t(1) * ... * args); }
 
-// Helper to map an Array into a memory mapped file
-template<size_t N, typename... Args>
-void map_array(MMap& m, Array<N>& a, Args... args) {
-    a.base = m.next(argmul(args...));
-    a.mem_mapped = true; // prevent new memory allocation
-    a.alloc(args...);
-}
-
 template <size_t N>
 struct Array : Array<N-1> {
 
@@ -125,9 +119,9 @@ struct Array : Array<N-1> {
 };
 
 // ----------------------------------------------------------------------------
-// Transformer and RunState structs, and related initializations
+// Transformer model
 
-struct Config {
+struct Transformer {
     int32_t dim;        // transformer dimension
     int32_t hidden_dim; // for ffn layers
     int32_t n_layers;   // number of layers
@@ -135,9 +129,7 @@ struct Config {
     int32_t n_kv_heads; // number of key/value heads (can be < query heads because of multiquery)
     int32_t vocab_size; // vocabulary size, usually 256 (byte-level)
     int32_t seq_len;    // max sequence length
-};
 
-struct TransformerWeights {
     // token embedding table
     Array<2> token_embedding_table; // (vocab_size, dim)
     // weights for rmsnorms
@@ -159,19 +151,17 @@ struct TransformerWeights {
     // freq_cis_imag (seq_len, head_size / 2) we don't use it
     // (optional) classifier weights for the logits, on the last layer
     float* wcls;
-};
 
-struct RunState {
     // Current wave of activations
     Array<1> x;   // activation at current time stamp (dim,)
     Array<2> xb;  // same, but inside a residual branch (dim,)
     Array<1> xb2; // an additional buffer just for convenience (dim,)
     Array<1> hb;  // buffer for hidden dimension in the ffn (hidden_dim,)
     Array<1> hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
-    Array<2> q;   // query (dim,)
-    Array<2> k;   // key (kv_dim,)
-    Array<2> v;   // value (kv_dim,)
-    Array<2> att; // buffer for scores/attention values (n_heads, seq_len)
+    Array<2> query; // query (dim,)
+    Array<2> key;   // key (kv_dim,)
+    Array<2> value; // value (kv_dim,)
+    Array<2> attention; // buffer for scores/attention values (n_heads, seq_len)
     Array<1> logits; // output logits (vocab_size)
     // Key and Value cache
     Array<4> key_cache;   // (layer, seq_len, n_kv_heads, head_size)
@@ -179,30 +169,73 @@ struct RunState {
     // freq_cis for RoPE relatively positional embeddings (not used anymore)
     Array<2> freq_cis; // (seq_len, head_size);
 
-    RunState(const Config&);
+    MMap mmap;
+
+    Transformer(const string& model_file);
+    float* forward(int token, int pos);
+
+    // Helper to map an Array into a memory mapped file
+    template<size_t N, typename... Args>
+    void map_array(Array<N>& a, Args... args) {
+        a.base = mmap.next(argmul(args...));
+        a.mem_mapped = true; // prevent new memory allocation
+        a.alloc(args...);
+    }
 };
 
-RunState::RunState(const Config& p) {
+Transformer::Transformer(const string& model_file) : mmap(model_file) {
 
-    int head_size = p.dim / p.n_heads;
+    // read in config header
+    dim        = *mmap.next<int32_t>();
+    hidden_dim = *mmap.next<int32_t>();
+    n_layers   = *mmap.next<int32_t>();
+    n_heads    = *mmap.next<int32_t>();
+    n_kv_heads = *mmap.next<int32_t>();
+    vocab_size = *mmap.next<int32_t>();
+    seq_len    = *mmap.next<int32_t>();
 
-    x.alloc(p.dim);
-    xb.alloc(p.n_heads, head_size); // dim == n_heads * head_size
-    xb2.alloc(p.dim);
-    hb.alloc(p.hidden_dim);
-    hb2.alloc(p.hidden_dim);
-    q.alloc(p.n_heads, head_size);
-    k.alloc(p.n_kv_heads, head_size);
-    v.alloc(p.n_kv_heads, head_size);
-    att.alloc(p.n_heads, p.seq_len);
-    logits.alloc(p.vocab_size);
-    key_cache.alloc(p.n_layers, p.seq_len, p.n_kv_heads, head_size);
-    value_cache.alloc(p.n_layers, p.seq_len, p.n_kv_heads, head_size);
-    freq_cis.alloc(p.seq_len, head_size);
+    // negative vocab size is hacky way of signaling unshared weights. bit yikes.
+    bool shared_weights = (vocab_size > 0);
+    vocab_size = abs(vocab_size);
 
-    // Compute freq_cis
+    // memory map the Transformer weights into the data pointer
+    int head_size = dim / n_heads;
+
+    map_array(token_embedding_table, vocab_size, dim);
+    map_array(rms_att_weight, n_layers, dim);
+    map_array(wq, n_layers, dim, n_heads, head_size);
+    map_array(wk, n_layers, dim, n_kv_heads, head_size);
+    map_array(wv, n_layers, dim, n_kv_heads, head_size);
+    map_array(wo, n_layers, n_heads, head_size, dim);
+    map_array(rms_ffn_weight, n_layers, dim);
+    map_array(w1, n_layers, hidden_dim, dim);
+    map_array(w2, n_layers, dim, hidden_dim);
+    map_array(w3, n_layers, hidden_dim, dim);
+    map_array(rms_final_weight, dim);
+
+ /* freq_cis_real */ mmap.next(seq_len * head_size / 2);
+ /* freq_cis_imag */ mmap.next(seq_len * head_size / 2);
+
+    wcls = shared_weights ? token_embedding_table : mmap.next(vocab_size * dim);
+
+    // allocate the run-state buffers
+    x.alloc(dim);
+    xb.alloc(n_heads, head_size); // dim == n_heads * head_size
+    xb2.alloc(dim);
+    hb.alloc(hidden_dim);
+    hb2.alloc(hidden_dim);
+    query.alloc(n_heads, head_size);
+    key.alloc(n_kv_heads, head_size);
+    value.alloc(n_kv_heads, head_size);
+    attention.alloc(n_heads, seq_len);
+    logits.alloc(vocab_size);
+    key_cache.alloc(n_layers, seq_len, n_kv_heads, head_size);
+    value_cache.alloc(n_layers, seq_len, n_kv_heads, head_size);
+    freq_cis.alloc(seq_len, head_size);
+
+    // compute freq_cis
     float* ptr = freq_cis;
-    for (int pos = 0; pos < p.seq_len; pos++) {
+    for (int pos = 0; pos < seq_len; pos++) {
         for (int i = 0; i < head_size; i += 2) {
             float freq = 1.0f / powf(10000.0f, float(i) / head_size);
             freq *= pos;
@@ -210,140 +243,15 @@ RunState::RunState(const Config& p) {
             *ptr++ = sinf(freq); // imaginary part
         }
     }
-}
-
-void init_from_mmap(MMap& m, MMap& t, Config* p, TransformerWeights* w,
-                    vector<string>* vocab, vector<float>* vocab_scores) {
-
-    // Read in config header, all Config fields are int32_t,
-    // so define a union with an array to iterate over them
-    static const size_t N = sizeof(Config) / sizeof(int32_t);
-    union U { struct Config; int32_t vec[N]; };
-    for (auto& v : reinterpret_cast<U*>(p)->vec)
-        v = *m.next<int32_t>();
-
-    // Negative vocab size is hacky way of signaling unshared weights. bit yikes.
-    bool shared_weights = (p->vocab_size > 0);
-    p->vocab_size = abs(p->vocab_size);
-
-    // Memory map the Transformer weights into the data pointer
-    int head_size = p->dim / p->n_heads;
-
-    map_array(m, w->token_embedding_table, p->vocab_size, p->dim);
-    map_array(m, w->rms_att_weight, p->n_layers, p->dim);
-    map_array(m, w->wq, p->n_layers, p->dim, p->n_heads, head_size);
-    map_array(m, w->wk, p->n_layers, p->dim, p->n_kv_heads, head_size);
-    map_array(m, w->wv, p->n_layers, p->dim, p->n_kv_heads, head_size);
-    map_array(m, w->wo, p->n_layers, p->n_heads, head_size, p->dim);
-    map_array(m, w->rms_ffn_weight, p->n_layers, p->dim);
-    map_array(m, w->w1, p->n_layers, p->hidden_dim, p->dim);
-    map_array(m, w->w2, p->n_layers, p->dim, p->hidden_dim);
-    map_array(m, w->w3, p->n_layers, p->hidden_dim, p->dim);
-    map_array(m, w->rms_final_weight, p->dim);
-
- /* w->freq_cis_real */ m.next(p->seq_len * head_size / 2);
- /* w->freq_cis_imag */ m.next(p->seq_len * head_size / 2);
-
-    w->wcls = shared_weights ? w->token_embedding_table : m.next(p->vocab_size * p->dim);
-
-    // Read in the tokenizer .bin file
-    t.next<float>(); // ignore max_token_length
-    for (int i = 0; i < p->vocab_size; i++) {
-        float score = *t.next<float>();
-        int32_t len = *t.next<int32_t>();
-        char* c = t.next<char>(len);
-        vocab->push_back(string(c, len));
-        vocab_scores->push_back(score);
-    }
-}
-
-// ----------------------------------------------------------------------------
-// utilities: time / rng
-
-long time_in_ms() {
-    // return time in milliseconds, for benchmarking the model speed
-    struct timespec time;
-    clock_gettime(CLOCK_REALTIME, &time);
-    return time.tv_sec * 1000 + time.tv_nsec / 1000000;
-}
-
-namespace RNG {
-
-    unsigned long long seed; // should be set before use, cannot be 0
-
-    unsigned int random_u32() {
-        // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
-        seed ^= seed >> 12;
-        seed ^= seed << 25;
-        seed ^= seed >> 27;
-        return (seed * 0x2545F4914F6CDD1Dull) >> 32;
-    }
-
-    float random_f32() { // random float32 in [0,1)
-        return (random_u32() >> 8) / 16777216.0f;
-    }
 };
 
 // ----------------------------------------------------------------------------
-// sampling can be done in a few ways: greedy argmax, sampling or top-p sampling
+// neural net blocks; the dynamics of the Transformer
 
 int argmax(float* prob, int n) {
-    // return the index with the highest probability
+    // return the index with the highest value
     return std::distance(prob, max_element(prob, prob + n));
 }
-
-// top-p sampling (or "nucleus sampling") samples from the smallest set of
-// tokens that exceed probability topp. This way we never sample tokens that
-// have very low probabilities and are less likely to go "off the rails".
-//
-// if topp <= 0 or > 1 simply sample from the predicted probability distribution
-int sample(float* prob, float topp, int n) {
-
-    vector<int> v;
-    v.reserve(n);
-    float cumulative_prob = 1.0f;
-
-    if (topp <= 0 || topp > 1)
-        topp = 1.0f;
-
-    // values smaller than (1 - topp) / (n - 1) cannot be part of the result
-    // so for efficiency we crop these out as candidates before sorting
-    const float cutoff = (1.0f - topp) / (n - 1);
-    for (int i = 0; i < n; i++) {
-        if (prob[i] >= cutoff)
-            v.push_back(i);
-    }
-
-    if (topp < 1) {
-        // sort in descending order of indexed probabilities
-        sort(v.begin(), v.end(), [prob](int a, int b) { return prob[a] > prob[b]; });
-
-        // truncate the list where cumulative probability exceeds topp
-        cumulative_prob = 0.0f;
-        for (size_t i = 0; i < v.size(); i++) {
-            cumulative_prob += prob[v[i]];
-            if (cumulative_prob > topp) {
-                v.resize(i+1);
-                break; // we've exceeded topp by including this last item
-            }
-        }
-    }
-
-    // sample index from probabilities (they must sum to 1!)
-    float r = RNG::random_f32() * cumulative_prob;
-
-    float cdf = 0.0f;
-    for (size_t i = 0; i < v.size(); i++) {
-        cdf += prob[v[i]];
-        if (r < cdf)
-            return v[i];
-    }
-
-    return v.back(); // in case of rounding errors
-}
-
-// ----------------------------------------------------------------------------
-// neural net blocks
 
 void rmsnorm(float* o, float* x, float* w, int size) {
     // calculate sum of squares
@@ -398,32 +306,29 @@ void complexmul(float* a, float* b, float c, float d) {
     *b = a0 * d + *b * c;
 }
 
-void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights* w) {
+float* Transformer::forward(int token, int pos) {
 
     // a few convenience variables
-    float* x = s->x;
-    int dim = p->dim;
-    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
-    int hidden_dim =  p->hidden_dim;
-    int head_size = dim / p->n_heads;
+    int kv_dim = (dim * n_kv_heads) / n_heads;
+    int kv_mul = n_heads / n_kv_heads; // integer multiplier of the kv sharing in multiquery
+    int head_size = dim / n_heads;
 
     // copy the token embedding into x
-    memcpy(x, w->token_embedding_table(token), dim * sizeof(float));
+    memcpy(x, token_embedding_table(token), dim * sizeof(float));
 
     // pluck out the "pos" row of freq_cis
-    float* freq = s->freq_cis(pos);
+    float* freq = freq_cis(pos);
 
     // forward all the layers
-    for (int l = 0; l < p->n_layers; l++) {
+    for (int l = 0; l < n_layers; l++) {
 
         // attention rmsnorm (Root Mean Square normalization)
-        rmsnorm(s->xb, x, w->rms_att_weight(l), dim);
+        rmsnorm(xb, x, rms_att_weight(l), dim);
 
         // qkv matmuls for this position (V X M = V)
-        matmul(s->q, s->xb, w->wq(l), dim, dim);
-        matmul(s->k, s->xb, w->wk(l), dim, kv_dim);
-        matmul(s->v, s->xb, w->wv(l), dim, kv_dim);
+        matmul(query, xb, wq(l), dim, dim);
+        matmul(key, xb, wk(l), dim, kv_dim);
+        matmul(value, xb, wv(l), dim, kv_dim);
 
         // RoPE relative positional encoding: complex-valued
         // rotate q and k by freq_cis in each head
@@ -431,27 +336,27 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         #pragma omp parallel for private(h)
         for (h = 0; h < dim; h += 2) {
             int k = (h % head_size);
-            complexmul(s->q+h, s->q+h+1, freq[k], freq[k+1]);
+            complexmul(query+h, query+h+1, freq[k], freq[k+1]);
             if (h < kv_dim) {
-                complexmul(s->k+h, s->k+h+1, freq[k], freq[k+1]);
+                complexmul(key+h, key+h+1, freq[k], freq[k+1]);
             }
         }
 
         // save key,value at this time step (pos) to our kv cache
-        memcpy(s->key_cache(l, pos), s->k, kv_dim * sizeof(float));
-        memcpy(s->value_cache(l, pos), s->v, kv_dim * sizeof(float));
+        memcpy(key_cache(l, pos), key, kv_dim * sizeof(float));
+        memcpy(value_cache(l, pos), value, kv_dim * sizeof(float));
 
         // multihead attention. iterate over all heads
         #pragma omp parallel for private(h)
-        for (h = 0; h < p->n_heads; h++) {
+        for (h = 0; h < n_heads; h++) {
             // get the query vector for this head
-            float* q = s->q(h);
+            float* q = query(h);
             // attention scores for this head
-            float* att = s->att(h);
+            float* att = attention(h);
             // iterate over all timesteps, including the current one
             for (int t = 0; t <= pos; t++) {
                 // get the key vector for this head and at this timestep
-                float* k = s->key_cache(l, t, h / kv_mul);
+                float* k = key_cache(l, t, h / kv_mul);
                 // calculate the attention score as the dot product of q and k
                 float score = 0.0f;
                 for (int i = 0; i < head_size; i++) {
@@ -467,83 +372,111 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
             softmax(att, pos + 1);
 
             // weighted sum of the values, store back into xb
-            float* xb = s->xb(h);
-            memset(xb, 0, head_size * sizeof(float));
+            float* xb_h = xb(h);
+            memset(xb_h, 0, head_size * sizeof(float));
             for (int t = 0; t <= pos; t++) {
                 // get the value vector for this head and at this timestep
-                float* v = s->value_cache(l, t, h / kv_mul);
+                float* v = value_cache(l, t, h / kv_mul);
                 // get the attention weight for this timestep
                 float a = att[t];
-                // accumulate the weighted value into xb
+                // accumulate the weighted value into xb_h
                 for (int i = 0; i < head_size; i++) {
-                    xb[i] += a * v[i];
+                    xb_h[i] += a * v[i];
                 }
             }
         }
 
         // final matmul to get the output of the attention
-        matmul(s->xb2, s->xb, w->wo(l), dim, dim);
+        matmul(xb2, xb, wo(l), dim, dim);
 
         // residual connection back into x
         for (int i = 0; i < dim; i++) {
-            x[i] += s->xb2[i];
+            x[i] += xb2[i];
         }
 
         // ffn rmsnorm
-        rmsnorm(s->xb, x, w->rms_ffn_weight(l), dim);
+        rmsnorm(xb, x, rms_ffn_weight(l), dim);
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
-        matmul(s->hb, s->xb, w->w1(l), dim, hidden_dim);
-        matmul(s->hb2, s->xb, w->w3(l), dim, hidden_dim);
+        matmul(hb, xb, w1(l), dim, hidden_dim);
+        matmul(hb2, xb, w3(l), dim, hidden_dim);
 
         // F.silu; silu(x)=x*σ(x),where σ(x) is the logistic sigmoid
         for (int i = 0; i < hidden_dim; i++) {
-            s->hb[i] = s->hb[i] * (1.0f / (1.0f + expf(-s->hb[i])));
+            hb[i] = hb[i] * (1.0f / (1.0f + expf(-hb[i])));
         }
 
         // elementwise multiply with w3(x)
         for (int i = 0; i < hidden_dim; i++) {
-            s->hb[i] = s->hb[i] * s->hb2[i];
+            hb[i] = hb[i] * hb2[i];
         }
 
         // final matmul to get the output of the ffn
-        matmul(s->xb, s->hb, w->w2(l), hidden_dim, dim);
+        matmul(xb, hb, w2(l), hidden_dim, dim);
 
         // residual connection
         for (int i = 0; i < dim; i++) {
-            x[i] += s->xb[i];
+            x[i] += xb[i];
         }
     }
 
     // final rmsnorm
-    rmsnorm(x, x, w->rms_final_weight, dim);
+    rmsnorm(x, x, rms_final_weight, dim);
 
     // classifier into logits
-    matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+    matmul(logits, x, wcls, dim, vocab_size);
+
+    return logits;
 }
 
 // ----------------------------------------------------------------------------
-// byte pair encoding (BPE) tokenizer, encodes strings into tokens so we can prompt
+// The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
 
-int str_lookup(const string& str, const map<string, int>& sorted_vocab) {
+struct Tokenizer {
+
+    Tokenizer(const string& tokenizer_file, int vocab_size);
+    int str_lookup(const string& str);
+    void encode(vector<int>* tokens_ptr, const string& text);
+    string decode(int prev_token, int token);
+
+    MMap mmap;
+
+    vector<string> vocab;
+    vector<float> vocab_scores;
+    map<string, int> sorted_vocab;
+};
+
+Tokenizer::Tokenizer(const string& tokenizer_file, int vocab_size) : mmap(tokenizer_file) {
+
+    // Read in the tokenizer .bin file
+    mmap.next<float>(); // ignore max_token_length
+    for (int i = 0; i < vocab_size; i++) {
+        float score = *mmap.next<float>();
+        int32_t len = *mmap.next<int32_t>();
+        char* c = mmap.next<char>(len);
+        vocab.push_back(string(c, len));
+        vocab_scores.push_back(score);
+    }
+
+    // sort vocabulary
+    for (size_t i = 0; i < vocab.size(); i++)
+        sorted_vocab[vocab[i]] = i;
+}
+
+int Tokenizer::str_lookup(const string& str) {
 
     auto it = sorted_vocab.find(str);
     return it != sorted_vocab.end() ? it->second : -1;
 }
 
-void bpe_encode(vector<int>* tokens_ptr, const string& text, const vector<string>& vocab, const vector<float>& vocab_scores) {
+void Tokenizer::encode(vector<int>* tokens_ptr, const string& text) {
 
     vector<int>& tokens = *tokens_ptr; // syntactic sugar
-    map<string, int> sorted_vocab;
     string str;
 
-    // sort vocabulary
-    for (size_t i = 0; i < vocab.size(); i++)
-        sorted_vocab[vocab[i]] = i;
-
     // add_dummy_prefix is true by default
-    tokens.push_back(str_lookup(" ", sorted_vocab));
+    tokens.push_back(str_lookup(" "));
 
     // first encode every individual character in the input (UTF-8) string
     for (size_t i = 0; i < text.size(); ) {
@@ -558,7 +491,7 @@ void bpe_encode(vector<int>* tokens_ptr, const string& text, const vector<string
 
         // extract the UTF-8 character and look it up in the vocabulary
         str = text.substr(start, i - start);
-        int id = str_lookup(str, sorted_vocab);
+        int id = str_lookup(str);
         if (id != -1) {
             // we found this codepoint in vocab, add it as a token
             tokens.push_back(id);
@@ -580,7 +513,7 @@ void bpe_encode(vector<int>* tokens_ptr, const string& text, const vector<string
         // find all possible merges between two consecutive tokens in [start, end)
         for (int i = start; i < end; i++) {
             str = vocab[tokens[i]] + vocab[tokens[i+1]];
-            int id = str_lookup(str, sorted_vocab);
+            int id = str_lookup(str);
             sv[i] = (id != -1 ? vocab_scores[id] : -1e10);
         }
         // pick the best one with the highest score
@@ -591,7 +524,7 @@ void bpe_encode(vector<int>* tokens_ptr, const string& text, const vector<string
 
         // merge the consecutive pair (best_idx, best_idx+1) into a new token
         str = vocab[tokens[best_idx]] + vocab[tokens[best_idx+1]];
-        tokens[best_idx] = str_lookup(str, sorted_vocab);
+        tokens[best_idx] = str_lookup(str);
 
         // delete token at position best_idx+1, shift the entire sequence back 1
         tokens.erase(tokens.begin() + best_idx + 1);
@@ -604,46 +537,167 @@ void bpe_encode(vector<int>* tokens_ptr, const string& text, const vector<string
     }
 }
 
+string Tokenizer::decode(int prev_token, int token) {
+
+    // following BOS token, sentencepiece decoder strips any leading whitespace (see PR #89)
+    string token_str = vocab[token];
+    if (prev_token == BOS && token_str[0] == ' ')
+        token_str.erase(0, 1);
+
+    // careful, some tokens designate raw bytes, and look like e.g. '<0x01>'
+    unsigned char byte_val;
+    if (sscanf(token_str.c_str(), "<0x%02hhX>", &byte_val) == 1) {
+        // ok this token is a raw byte token, carefuly to only print printable chars or whitespace
+        // some of the other bytes can be various control codes, backspace, etc. => skip
+        token_str = isprint(byte_val) || isspace(byte_val) ? string(1, byte_val) : "";
+    }
+    return token_str;
+}
+
 // ----------------------------------------------------------------------------
-// main loop, runs model inference
+// utilities: time / rng
 
-long run_model(int* steps, float temperature, float topp, int colour, const vector<int>& prompt_tokens,
-               RunState& state, Config& config, TransformerWeights& weights, const vector<string>& vocab) {
+long time_in_ms() {
+    // return time in milliseconds, for benchmarking the model speed
+    struct timespec time;
+    clock_gettime(CLOCK_REALTIME, &time);
+    return time.tv_sec * 1000 + time.tv_nsec / 1000000;
+}
 
-    static const int BOS = 1; // BOS token
+namespace RNG {
 
-    // ANSI color codes: red, orange, yellow, light green, default
-    const vector<string> Colors({ "\033[31m", "\033[38;5;208m", "\033[38;5;226m", "\033[38;5;118m", "" });
+    unsigned long long seed; // should be set before use, cannot be 0
 
+    unsigned int random_u32() {
+        // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
+        seed ^= seed >> 12;
+        seed ^= seed << 25;
+        seed ^= seed >> 27;
+        return (seed * 0x2545F4914F6CDD1Dull) >> 32;
+    }
+
+    float random_f32() { // random float32 in [0,1)
+        return (random_u32() >> 8) / 16777216.0f;
+    }
+};
+
+// ----------------------------------------------------------------------------
+// The Sampler, which takes logits and returns a sampled token
+// sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
+
+struct Sampler {
+
+    Sampler(int n, float temp, float tp) {
+        vocab_size = n;
+        temperature = temp;
+        topp = tp;
+    }
+
+    int sample_topp(float* prob);
+    int sample(float* logits);
+
+    int vocab_size;
+    float temperature;
+    float topp;
+};
+
+// top-p sampling (or "nucleus sampling") samples from the smallest set of
+// tokens that exceed probability topp. This way we never sample tokens that
+// have very low probabilities and are less likely to go "off the rails".
+//
+// if topp <= 0 or > 1 simply sample from the predicted probability distribution
+int Sampler::sample_topp(float* prob) {
+
+    vector<int> v;
+    v.reserve(vocab_size);
+    float cumulative_prob = 1.0f;
+
+    if (topp <= 0 || topp > 1)
+        topp = 1.0f;
+
+    // values smaller than (1 - topp) / (n - 1) cannot be part of the result
+    // so for efficiency we crop these out as candidates before sorting
+    const float cutoff = (1.0f - topp) / (vocab_size - 1);
+    for (int i = 0; i < vocab_size; i++) {
+        if (prob[i] >= cutoff)
+            v.push_back(i);
+    }
+
+    if (topp < 1) {
+        // sort in descending order of indexed probabilities
+        sort(v.begin(), v.end(), [prob](int a, int b) { return prob[a] > prob[b]; });
+
+        // truncate the list where cumulative probability exceeds topp
+        cumulative_prob = 0.0f;
+        for (size_t i = 0; i < v.size(); i++) {
+            cumulative_prob += prob[v[i]];
+            if (cumulative_prob > topp) {
+                v.resize(i+1);
+                break; // we've exceeded topp by including this last item
+            }
+        }
+    }
+
+    // sample index from probabilities (they must sum to 1!)
+    float r = RNG::random_f32() * cumulative_prob;
+
+    float cdf = 0.0f;
+    for (size_t i = 0; i < v.size(); i++) {
+        cdf += prob[v[i]];
+        if (r < cdf)
+            return v[i];
+    }
+
+    return v.back(); // in case of rounding errors
+}
+
+int Sampler::sample(float* logits) {
+
+    // sample the token given the logits and some hyperparameters
+    int next;
+    if (temperature == 0.0f) {
+        // greedy argmax sampling: take the token with the highest probability
+        next = argmax(logits, vocab_size);
+    } else {
+        // apply softmax to the logits to get the probabilities for next token
+        softmax(logits, vocab_size, temperature);
+
+        // sample from this distribution to get the next token
+        // if topp > 0 we (also) perform top-p (nucleus) sampling, clamping the least likely
+        // tokens to zero. Othewise sample from the predicted probability distribution.
+        next = sample_topp(logits);
+    }
+    return next;
+}
+
+// ----------------------------------------------------------------------------
+// generation loop
+
+void generate(Transformer& t, Tokenizer& tok, Sampler& sampler, const string& prompt, int steps) {
+
+    // encode the (string) prompt into tokens sequence, if any is given
+    vector<int> prompt_tokens;
+    if (!prompt.empty())
+        tok.encode(&prompt_tokens, prompt);
+
+    // start the main loop
     long start = 0;  // used to time our code, only initialized after first iteration
     int next;        // will store the next token in the sequence
     int token = BOS; // init with token BOS, as done in Llama-2 sentencepiece tokenizer
     int pos = 0;     // position in the sequence
 
-    while (pos < *steps) {
+    while (pos < steps) {
 
         // forward the transformer to get logits for the next token
-        transformer(token, pos, &config, &state, &weights);
+        float* logits = t.forward(token, pos);
 
         // advance the state machine
         if (pos < (int)prompt_tokens.size()) {
             // if we are still processing the input prompt, force the next prompt token
             next = prompt_tokens[pos];
         } else {
-            // sample the next token
-            if (temperature == 0.0f) {
-                // greedy argmax sampling: take the token with the highest probability
-                next = argmax(state.logits, config.vocab_size);
-            } else {
-                // apply softmax with temperature to the logits to get the
-                // probabilities for next token.
-                softmax(state.logits, config.vocab_size, temperature);
-
-                // sample from this distribution to get the next token
-                // if topp > 0 we (also) perform top-p (nucleus) sampling, clamping the least likely
-                // tokens to zero. Othewise sample from the predicted probability distribution.
-                next = sample(state.logits, topp, config.vocab_size);
-            }
+            // otherwise sample the next token from the logits
+            next = sampler.sample(logits);
         }
 
         pos++; // increment before a possible early exit due to a BOS token
@@ -652,24 +706,8 @@ long run_model(int* steps, float temperature, float topp, int colour, const vect
         if (next == BOS)
             break;
 
-        // following BOS token, sentencepiece decoder strips any leading whitespace (see PR #89)
-        string next_str = vocab[next];
-        if (token == BOS && next_str[0] == ' ')
-            next_str.erase(0, 1);
-
-        // careful, some tokens designate raw bytes, and look like e.g. '<0x01>'
-        unsigned char byte_val;
-        if (sscanf(next_str.c_str(), "<0x%02hhX>", &byte_val) == 1) {
-            // ok this token is a raw byte token, carefuly to only print printable chars or whitespace
-            // some of the other bytes can be various control codes, backspace, etc. => skip
-            next_str = isprint(byte_val) || isspace(byte_val) ? string(1, byte_val) : "";
-        }
-
-        // assign ANSI colour to token if colour option is set
-        float prob = state.logits[next];
-        if (colour && prob > 0 && prob < 1)
-            next_str = Colors[int(prob * 5)] + next_str + "\033[0m";
-
+        // print the token as string, decode it with the Tokenizer object
+        string next_str = tok.decode(token, next);
         cout << next_str << std::flush;
         token = next;
 
@@ -678,20 +716,27 @@ long run_model(int* steps, float temperature, float topp, int colour, const vect
             start = time_in_ms();
     }
     cout << endl;
-    *steps = pos;
-    return time_in_ms() - start; // elapsed time in ms
+
+    // report achieved tok/s (pos-1 because the timer starts after first iteration)
+    if (pos > 1) {
+        long elapsed = time_in_ms() - start;
+        cerr << "\nachieved tok/s: " << (pos-1) / (double)(elapsed)*1000 << endl;
+    }
 }
 
-void print_model_info(const Config& config, vector<string>& vocab) {
+// ----------------------------------------------------------------------------
+// int main
+
+void print_model_info(const Transformer& t) {
     cerr << "\nModel parameters:\n"
-         << "\n    Vocab size " << vocab.size()
-         << "\n    Dimension " << config.dim
-         << "\n    Hidden dim " << config.dim
-         << "\n    Num heads " << config.n_heads
-         << "\n    Num kv heads " << config.n_kv_heads
-         << "\n    Head size (dim / num heads) " << config.dim / config.n_heads
-         << "\n    Num layers " << config.n_layers
-         << "\n    Max context (tokens) " << config.seq_len
+         << "\n    Vocab size " << t.vocab_size
+         << "\n    Dimension " << t.dim
+         << "\n    Hidden dim " << t.hidden_dim
+         << "\n    Num heads " << t.n_heads
+         << "\n    Num kv heads " << t.n_kv_heads
+         << "\n    Head size (dim / num heads) " << t.dim / t.n_heads
+         << "\n    Num layers " << t.n_layers
+         << "\n    Max context (tokens) " << t.seq_len
          << "\n" << endl;
 }
 
@@ -711,22 +756,21 @@ void error_usage() {
 
 int main(int argc, char* argv[]) {
 
-    // default inits
+    // default parameters
+    string checkpoint_path;  // e.g. out/model.bin
+    string tokenizer_path = "tokenizer.bin";
     float temperature = 1.0f; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 0.9f;        // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
-    RNG::seed = 0;            // seed rng with time by default
-    int steps = 256;          // max number of steps to run for, 0: use seq_len
-    int colour = 0;           // colour the prompt based on there logistic probability
+    int steps = 256;          // number of steps to run for
     string prompt;            // prompt string
-    string checkpoint;        // e.g. out/model.bin
-    string tokenizer = "tokenizer.bin";
+    RNG::seed = 0;            // seed rng with time by default
 
     // 'checkpoint' is necessary, optional arguments and their values
     // come in pairs, so argc must be even.
     if (argc % 2 != 0)
         error_usage();
 
-    checkpoint = string(argv[1]);
+    checkpoint_path = string(argv[1]);
 
     // Read in any optional argument
     if (argc > 2) {
@@ -736,48 +780,33 @@ int main(int argc, char* argv[]) {
             else if (opt[i] == "-p") topp = stof(opt[i+1]);
             else if (opt[i] == "-s") RNG::seed = stoi(opt[i+1]);
             else if (opt[i] == "-n") steps = stoi(opt[i+1]);
-            else if (opt[i] == "-c") colour = stoi(opt[i+1]);
             else if (opt[i] == "-i") prompt = opt[i+1];
-            else if (opt[i] == "-z") tokenizer = opt[i+1];
+            else if (opt[i] == "-z") tokenizer_path = opt[i+1];
             else
                 error_usage();
         }
     }
 
-    if (RNG::seed == 0)
-        RNG::seed = (unsigned int)time(NULL);
+    // parameter validation/overrides
+    if (RNG::seed <= 0) RNG::seed = (unsigned int)time(NULL);
+    if (temperature < 0.0) temperature = 0.0;
+    if (topp < 0.0 || 1.0 < topp) topp = 0.9;
+    if (steps < 0) steps = 0;
 
-    // Read in model.bin
-    Config config;
-    TransformerWeights weights;
-    vector<string> vocab;
-    vector<float> vocab_scores;
+    // build the Transformer via the model .bin file
+    Transformer transformer(checkpoint_path);
+    if (steps == 0) steps = transformer.seq_len; // ovrerride to ~max length
 
-    // Memory map the checkpoint file and init weights
-    MMap mmap(checkpoint);
-    MMap tkmap(tokenizer);
-    init_from_mmap(mmap, tkmap, &config, &weights, &vocab, &vocab_scores);
+    print_model_info(transformer);
 
-    // Create and init the application RunState
-    RunState state(config);
+    // build the Tokenizer via the tokenizer .bin file
+    Tokenizer tokenizer(tokenizer_path, transformer.vocab_size);
 
-    print_model_info(config, vocab);
+    // build the Sampler
+    Sampler sampler(transformer.vocab_size, temperature, topp);
 
-    // Process the prompt, if any
-    vector<int> prompt_tokens;
-    if (!prompt.empty())
-        bpe_encode(&prompt_tokens, prompt, vocab, vocab_scores);
-
-    // Right now we cannot run for more than config.seq_len steps
-    if (steps <= 0 || steps > config.seq_len)
-        steps = config.seq_len;
-
-    // Run the model for the given number of steps or until BOS token
-    long elapsed = run_model(&steps, temperature, topp, colour, prompt_tokens, state, config, weights, vocab);
-
-    // report achieved tok/s (steps-1 because the timer starts after first iteration)
-    if (steps > 1)
-        cerr << "\nachieved tok/s: " << (steps-1) / (double)(elapsed)*1000 << endl;
+    // run!
+    generate(transformer, tokenizer, sampler, prompt, steps);
 
     return 0;
 }
