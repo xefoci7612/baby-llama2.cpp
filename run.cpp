@@ -402,14 +402,14 @@ float* Transformer::forward(int token, int pos) {
         matmul(hb, xb, w1(l), dim, hidden_dim);
         matmul(hb2, xb, w3(l), dim, hidden_dim);
 
-        // F.silu; silu(x)=x*σ(x),where σ(x) is the logistic sigmoid
+        // SwiGLU non-linearity
         for (int i = 0; i < hidden_dim; i++) {
-            hb[i] = hb[i] * (1.0f / (1.0f + expf(-hb[i])));
-        }
-
-        // elementwise multiply with w3(x)
-        for (int i = 0; i < hidden_dim; i++) {
-            hb[i] = hb[i] * hb2[i];
+            float val = hb[i];
+            // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
+            val *= (1.0f / (1.0f + expf(-val)));
+            // elementwise multiply with w3(x)
+            val *= hb2[i];
+            hb[i] = val;
         }
 
         // final matmul to get the output of the ffn
@@ -744,8 +744,8 @@ void error_usage() {
     cerr << "Usage:   run <checkpoint> [options]\n"
             "Example: run model.bin -n 256 -i \"Once upon a time\"\n"
             "Options:\n"
-            "  -t <float>  temperature, default 1.0\n"
-            "  -p <float>  p value in top-p (nucleus) sampling. default 0.9\n"
+            "  -t <float>  temperature in [0,inf], default 1.0\n"
+            "  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.9\n"
             "  -s <int>    random seed, default time(NULL)\n"
             "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n"
             "  -c <bool>   colour the probability of the next token, default 0 (false)\n"
