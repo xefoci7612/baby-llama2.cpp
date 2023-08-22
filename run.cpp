@@ -555,58 +555,46 @@ string Tokenizer::decode(int prev_token, int token) {
 }
 
 // ----------------------------------------------------------------------------
-// utilities: time / rng
-
-long time_in_ms() {
-    // return time in milliseconds, for benchmarking the model speed
-    struct timespec time;
-    clock_gettime(CLOCK_REALTIME, &time);
-    return time.tv_sec * 1000 + time.tv_nsec / 1000000;
-}
-
-namespace RNG {
-
-    unsigned long long seed; // should be set before use, cannot be 0
-
-    unsigned int random_u32() {
-        // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
-        seed ^= seed >> 12;
-        seed ^= seed << 25;
-        seed ^= seed >> 27;
-        return (seed * 0x2545F4914F6CDD1Dull) >> 32;
-    }
-
-    float random_f32() { // random float32 in [0,1)
-        return (random_u32() >> 8) / 16777216.0f;
-    }
-};
-
-// ----------------------------------------------------------------------------
 // The Sampler, which takes logits and returns a sampled token
 // sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
 
 struct Sampler {
 
-    Sampler(int n, float temp, float tp) {
+    Sampler(int n, float temp, float tp, unsigned long long rng_seed) {
         vocab_size = n;
         temperature = temp;
         topp = tp;
+        rng_state = rng_seed;
     }
 
-    int sample_topp(float* prob);
+    int sample_topp(float* prob, float coin);
     int sample(float* logits);
 
     int vocab_size;
     float temperature;
     float topp;
+    unsigned long long rng_state;
 };
+
+unsigned int random_u32(unsigned long long* state) {
+    // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
+    *state ^= *state >> 12;
+    *state ^= *state << 25;
+    *state ^= *state >> 27;
+    return (*state * 0x2545F4914F6CDD1Dull) >> 32;
+}
+
+float random_f32(unsigned long long* state) { // random float32 in [0,1)
+    return (random_u32(state) >> 8) / 16777216.0f;
+}
 
 // top-p sampling (or "nucleus sampling") samples from the smallest set of
 // tokens that exceed probability topp. This way we never sample tokens that
 // have very low probabilities and are less likely to go "off the rails".
 //
 // if topp <= 0 or > 1 simply sample from the predicted probability distribution
-int Sampler::sample_topp(float* prob) {
+// coin is a random number in [0, 1), usually from random_f32()
+int Sampler::sample_topp(float* prob, float coin) {
 
     vector<int> v;
     v.reserve(vocab_size);
@@ -638,9 +626,8 @@ int Sampler::sample_topp(float* prob) {
         }
     }
 
-    // sample index from probabilities (they must sum to 1!)
-    float r = RNG::random_f32() * cumulative_prob;
-
+    // sample from the truncated list
+    float r = coin * cumulative_prob;
     float cdf = 0.0f;
     for (size_t i = 0; i < v.size(); i++) {
         cdf += prob[v[i]];
@@ -662,12 +649,25 @@ int Sampler::sample(float* logits) {
         // apply softmax to the logits to get the probabilities for next token
         softmax(logits, vocab_size, temperature);
 
+        // flip a (float) coin (this is our source of entropy for sampling)
+        float coin = random_f32(&rng_state);
+
         // sample from this distribution to get the next token
         // if topp > 0 we (also) perform top-p (nucleus) sampling, clamping the least likely
         // tokens to zero. Othewise sample from the predicted probability distribution.
-        next = sample_topp(logits);
+        next = sample_topp(logits, coin);
     }
     return next;
+}
+
+// ----------------------------------------------------------------------------
+// utilities: time / rng
+
+long time_in_ms() {
+    // return time in milliseconds, for benchmarking the model speed
+    struct timespec time;
+    clock_gettime(CLOCK_REALTIME, &time);
+    return time.tv_sec * 1000 + time.tv_nsec / 1000000;
 }
 
 // ----------------------------------------------------------------------------
@@ -748,7 +748,6 @@ void error_usage() {
             "  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.9\n"
             "  -s <int>    random seed, default time(NULL)\n"
             "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n"
-            "  -c <bool>   colour the probability of the next token, default 0 (false)\n"
             "  -i <string> input prompt\n"
             "  -z <string> optional path to custom tokenizer\n" << endl;
     exit(EXIT_FAILURE);
@@ -763,7 +762,7 @@ int main(int argc, char* argv[]) {
     float topp = 0.9f;        // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
     int steps = 256;          // number of steps to run for
     string prompt;            // prompt string
-    RNG::seed = 0;            // seed rng with time by default
+    unsigned long long rng_seed = 0; // seed rng with time by default
 
     // 'checkpoint' is necessary, optional arguments and their values
     // come in pairs, so argc must be even.
@@ -778,7 +777,7 @@ int main(int argc, char* argv[]) {
         for (size_t i = 0; i < opt.size(); i += 2) {
             if      (opt[i] == "-t") temperature = stof(opt[i+1]);
             else if (opt[i] == "-p") topp = stof(opt[i+1]);
-            else if (opt[i] == "-s") RNG::seed = stoi(opt[i+1]);
+            else if (opt[i] == "-s") rng_seed = stoi(opt[i+1]);
             else if (opt[i] == "-n") steps = stoi(opt[i+1]);
             else if (opt[i] == "-i") prompt = opt[i+1];
             else if (opt[i] == "-z") tokenizer_path = opt[i+1];
@@ -788,7 +787,7 @@ int main(int argc, char* argv[]) {
     }
 
     // parameter validation/overrides
-    if (RNG::seed <= 0) RNG::seed = (unsigned int)time(NULL);
+    if (rng_seed <= 0) rng_seed = (unsigned int)time(NULL);
     if (temperature < 0.0) temperature = 0.0;
     if (topp < 0.0 || 1.0 < topp) topp = 0.9;
     if (steps < 0) steps = 0;
@@ -803,7 +802,7 @@ int main(int argc, char* argv[]) {
     Tokenizer tokenizer(tokenizer_path, transformer.vocab_size);
 
     // build the Sampler
-    Sampler sampler(transformer.vocab_size, temperature, topp);
+    Sampler sampler(transformer.vocab_size, temperature, topp, rng_seed);
 
     // run!
     generate(transformer, tokenizer, sampler, prompt, steps);
