@@ -135,7 +135,7 @@ struct Transformer {
     // weights for rmsnorms
     Array<2> rms_att_weight; // (layer, dim)
     Array<2> rms_ffn_weight; // (layer, dim)
-    // weights for matmuls
+    // weights for matmuls. note dim == n_heads * head_size
     Array<4> wq; // (layer, dim, n_heads, head_size)
     Array<4> wk; // (layer, dim, n_kv_heads, head_size)
     Array<4> wv; // (layer, dim, n_kv_heads, head_size)
@@ -146,9 +146,6 @@ struct Transformer {
     Array<3> w3; // (layer, hidden_dim, dim)
     // final rmsnorm
     Array<1> rms_final_weight; // (dim,)
-    // freq_cis for RoPE relatively positional embeddings
-    // freq_cis_real (seq_len, head_size / 2) we don't use it
-    // freq_cis_imag (seq_len, head_size / 2) we don't use it
     // (optional) classifier weights for the logits, on the last layer
     float* wcls;
 
@@ -166,7 +163,6 @@ struct Transformer {
     // Key and Value cache
     Array<4> key_cache;   // (layer, seq_len, n_kv_heads, head_size)
     Array<4> value_cache; // (layer, seq_len, n_kv_heads, head_size)
-    // freq_cis for RoPE relatively positional embeddings (not used anymore)
     Array<2> freq_cis; // (seq_len, head_size);
 
     MMap mmap;
@@ -185,7 +181,7 @@ struct Transformer {
 
 Transformer::Transformer(const string& model_file) : mmap(model_file) {
 
-    // read in config header
+    // read in the config header
     dim        = *mmap.next<int32_t>();
     hidden_dim = *mmap.next<int32_t>();
     n_layers   = *mmap.next<int32_t>();
@@ -213,8 +209,8 @@ Transformer::Transformer(const string& model_file) : mmap(model_file) {
     map_array(w3, n_layers, hidden_dim, dim);
     map_array(rms_final_weight, dim);
 
- /* freq_cis_real */ mmap.next(seq_len * head_size / 2);
- /* freq_cis_imag */ mmap.next(seq_len * head_size / 2);
+    mmap.next(seq_len * head_size / 2); // skip what used to be freq_cis_real (for RoPE)
+    mmap.next(seq_len * head_size / 2); // skip what used to be freq_cis_imag (for RoPE)
 
     wcls = shared_weights ? token_embedding_table : mmap.next(vocab_size * dim);
 
@@ -248,11 +244,6 @@ Transformer::Transformer(const string& model_file) : mmap(model_file) {
 // ----------------------------------------------------------------------------
 // neural net blocks; the dynamics of the Transformer
 
-int argmax(float* prob, int n) {
-    // return the index with the highest value
-    return std::distance(prob, max_element(prob, prob + n));
-}
-
 void rmsnorm(float* o, float* x, float* w, int size) {
     // calculate sum of squares
     float ss = 0.0f;
@@ -266,6 +257,11 @@ void rmsnorm(float* o, float* x, float* w, int size) {
     for (int j = 0; j < size; j++) {
         o[j] = w[j] * (ss * x[j]);
     }
+}
+
+int argmax(float* prob, int n) {
+    // return the index with the highest value
+    return std::distance(prob, max_element(prob, prob + n));
 }
 
 void softmax(float* x, int size, float temperature = 1.0f) {
@@ -331,7 +327,7 @@ float* Transformer::forward(int token, int pos) {
         matmul(value, xb, wv(l), dim, kv_dim);
 
         // RoPE relative positional encoding: complex-valued
-        // rotate q and k by freq_cis in each head
+        // rotate query and key by freq in each head
         int h;
         #pragma omp parallel for private(h)
         for (h = 0; h < dim; h += 2) {
@@ -379,7 +375,7 @@ float* Transformer::forward(int token, int pos) {
                 float* v = value_cache(l, t, h / kv_mul);
                 // get the attention weight for this timestep
                 float a = att[t];
-                // accumulate the weighted value into xb_h
+                // accumulate the weighted value into xb
                 for (int i = 0; i < head_size; i++) {
                     xb_h[i] += a * v[i];
                 }
@@ -426,7 +422,6 @@ float* Transformer::forward(int token, int pos) {
 
     // classifier into logits
     matmul(logits, x, wcls, dim, vocab_size);
-
     return logits;
 }
 
@@ -457,20 +452,35 @@ Tokenizer::Tokenizer(const string& tokenizer_file, int vocab_size) : mmap(tokeni
         char* c = mmap.next<char>(len);
         vocab.push_back(string(c, len));
         vocab_scores.push_back(score);
-    }
-
-    // sort vocabulary
-    for (size_t i = 0; i < vocab.size(); i++)
         sorted_vocab[vocab[i]] = i;
+    }
+}
+
+string Tokenizer::decode(int prev_token, int token) {
+
+    // following BOS token, sentencepiece decoder strips any leading whitespace (see PR #89)
+    string token_str = vocab[token];
+    if (prev_token == BOS && token_str[0] == ' ')
+        token_str.erase(0, 1);
+
+    // careful, some tokens designate raw bytes, and look like e.g. '<0x01>'
+    unsigned char byte_val;
+    if (sscanf(token_str.c_str(), "<0x%02hhX>", &byte_val) == 1) {
+        // ok this token is a raw byte token, carefuly to only print printable chars or whitespace
+        // some of the other bytes can be various control codes, backspace, etc. => skip
+        token_str = isprint(byte_val) || isspace(byte_val) ? string(1, byte_val) : "";
+    }
+    return token_str;
 }
 
 int Tokenizer::str_lookup(const string& str) {
-
+    // efficiently find the perfect match for str in vocab, return its index or -1 if not found
     auto it = sorted_vocab.find(str);
     return it != sorted_vocab.end() ? it->second : -1;
 }
 
 void Tokenizer::encode(vector<int>* tokens_ptr, const string& text) {
+    // encode the string text (input) into an upper-bound preallocated tokens[] array
 
     vector<int>& tokens = *tokens_ptr; // syntactic sugar
     string str;
@@ -537,23 +547,6 @@ void Tokenizer::encode(vector<int>* tokens_ptr, const string& text) {
     }
 }
 
-string Tokenizer::decode(int prev_token, int token) {
-
-    // following BOS token, sentencepiece decoder strips any leading whitespace (see PR #89)
-    string token_str = vocab[token];
-    if (prev_token == BOS && token_str[0] == ' ')
-        token_str.erase(0, 1);
-
-    // careful, some tokens designate raw bytes, and look like e.g. '<0x01>'
-    unsigned char byte_val;
-    if (sscanf(token_str.c_str(), "<0x%02hhX>", &byte_val) == 1) {
-        // ok this token is a raw byte token, carefuly to only print printable chars or whitespace
-        // some of the other bytes can be various control codes, backspace, etc. => skip
-        token_str = isprint(byte_val) || isspace(byte_val) ? string(1, byte_val) : "";
-    }
-    return token_str;
-}
-
 // ----------------------------------------------------------------------------
 // The Sampler, which takes logits and returns a sampled token
 // sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
@@ -591,9 +584,9 @@ float random_f32(unsigned long long* state) { // random float32 in [0,1)
 // top-p sampling (or "nucleus sampling") samples from the smallest set of
 // tokens that exceed probability topp. This way we never sample tokens that
 // have very low probabilities and are less likely to go "off the rails".
+// coin is a random number in [0, 1), usually from random_f32()
 //
 // if topp <= 0 or > 1 simply sample from the predicted probability distribution
-// coin is a random number in [0, 1), usually from random_f32()
 int Sampler::sample_topp(float* prob, float coin) {
 
     vector<int> v;
@@ -612,7 +605,7 @@ int Sampler::sample_topp(float* prob, float coin) {
     }
 
     if (topp < 1) {
-        // sort in descending order of indexed probabilities
+        // sort indices in descending order of probabilities
         sort(v.begin(), v.end(), [prob](int a, int b) { return prob[a] > prob[b]; });
 
         // truncate the list where cumulative probability exceeds topp
@@ -626,7 +619,7 @@ int Sampler::sample_topp(float* prob, float coin) {
         }
     }
 
-    // sample from the truncated list
+    // sample index from probabilities (they must sum to 1!)
     float r = coin * cumulative_prob;
     float cdf = 0.0f;
     for (size_t i = 0; i < v.size(); i++) {
@@ -639,7 +632,6 @@ int Sampler::sample_topp(float* prob, float coin) {
 }
 
 int Sampler::sample(float* logits) {
-
     // sample the token given the logits and some hyperparameters
     int next;
     if (temperature == 0.0f) {
@@ -652,7 +644,7 @@ int Sampler::sample(float* logits) {
         // flip a (float) coin (this is our source of entropy for sampling)
         float coin = random_f32(&rng_state);
 
-        // sample from this distribution to get the next token
+        // we sample from this distribution to get the next token
         // if topp > 0 we (also) perform top-p (nucleus) sampling, clamping the least likely
         // tokens to zero. Othewise sample from the predicted probability distribution.
         next = sample_topp(logits, coin);
@@ -661,7 +653,7 @@ int Sampler::sample(float* logits) {
 }
 
 // ----------------------------------------------------------------------------
-// utilities: time / rng
+// utilities: time
 
 long time_in_ms() {
     // return time in milliseconds, for benchmarking the model speed
@@ -771,7 +763,7 @@ int main(int argc, char* argv[]) {
 
     checkpoint_path = string(argv[1]);
 
-    // Read in any optional argument
+    // read in the args
     if (argc > 2) {
         vector<string> opt(argv + 2, argv + argc);
         for (size_t i = 0; i < opt.size(); i += 2) {
