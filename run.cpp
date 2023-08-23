@@ -23,6 +23,7 @@
 using namespace std;
 
 static const int BOS = 1; // sentencepiece BOS token
+static const int EOS = 2; // sentencepiece EOS token
 
 // ----------------------------------------------------------------------------
 // Memory mapping facility to load and read model and tokenizer files
@@ -436,7 +437,7 @@ struct Tokenizer {
 
     Tokenizer(const string& tokenizer_path, int vocab_size);
     int str_lookup(const string& str);
-    void encode(vector<int>* tokens_ptr, const string& text);
+    void encode(vector<int>* tokens_ptr, const string& text, bool bos, bool eos);
     string decode(int prev_token, int token);
 
     MMap mmap;
@@ -483,14 +484,23 @@ int Tokenizer::str_lookup(const string& str) {
     return it != sorted_vocab.end() ? it->second : -1;
 }
 
-void Tokenizer::encode(vector<int>* tokens_ptr, const string& text) {
+void Tokenizer::encode(vector<int>* tokens_ptr, const string& text, bool bos, bool eos) {
 
     // encode the string text (input) into tokens[] vector
+    // bos != 0 means prepend the BOS token (=1), eos != 0 means append the EOS token (=2)
     vector<int>& tokens = *tokens_ptr; // syntactic sugar
     string str;
 
+    // add optional BOS token, if desired
+    if (bos)
+        tokens.push_back(BOS);
+
     // add_dummy_prefix is true by default
-    tokens.push_back(str_lookup(" "));
+    // so prepend a dummy prefix token to the input string, but only if text != ""
+    // TODO: pretty sure this isn't correct in the general case but I don't have the
+    // energy to read more of the sentencepiece code to figure out what it's doing
+    if (!text.empty())
+        tokens.push_back(str_lookup(" "));
 
     // first encode every individual character in the input (UTF-8) string
     for (size_t i = 0; i < text.size(); ) {
@@ -549,6 +559,10 @@ void Tokenizer::encode(vector<int>* tokens_ptr, const string& text) {
         start = std::max(best_idx - 1, 0);
         end = std::min(best_idx + 1, static_cast<int>(sv.size()) - 1);
     }
+
+    // add optional EOS token, if desired
+    if (eos)
+        tokens.push_back(EOS);
 }
 
 // ----------------------------------------------------------------------------
@@ -670,15 +684,18 @@ long time_in_ms() {
 
 void generate(Transformer& transformer, Tokenizer& tokenizer, Sampler& sampler, const string& prompt, int steps) {
 
-    // encode the (string) prompt into tokens sequence, if any is given
+    // encode the (string) prompt into tokens sequence
     vector<int> prompt_tokens;
-    if (!prompt.empty())
-        tokenizer.encode(&prompt_tokens, prompt);
+    tokenizer.encode(&prompt_tokens, prompt, true, false);
+    if (prompt_tokens.size() < 1) {
+        cerr << "something is wrong, expected at least 1 prompt token" << endl;
+        exit(EXIT_FAILURE);
+    }
 
     // start the main loop
     long start = 0;  // used to time our code, only initialized after first iteration
     int next;        // will store the next token in the sequence
-    int token = BOS; // init with token BOS, as done in Llama-2 sentencepiece tokenizer
+    int token = prompt_tokens[0]; // kick off with the first token in the prompt
     int pos = 0;     // position in the sequence
 
     while (pos < steps) {
@@ -687,9 +704,9 @@ void generate(Transformer& transformer, Tokenizer& tokenizer, Sampler& sampler, 
         float* logits = transformer.forward(token, pos);
 
         // advance the state machine
-        if (pos < (int)prompt_tokens.size()) {
+        if (pos < (int)prompt_tokens.size() - 1) {
             // if we are still processing the input prompt, force the next prompt token
-            next = prompt_tokens[pos];
+            next = prompt_tokens[pos + 1];
         } else {
             // otherwise sample the next token from the logits
             next = sampler.sample(logits);
