@@ -22,24 +22,25 @@
 
 using namespace std;
 
-static const int BOS = 1; // BOS token
+static const int BOS = 1; // sentencepiece BOS token
 
 // ----------------------------------------------------------------------------
-// Memory mapping facility to load model and tokenizer files
+// Memory mapping facility to load and read model and tokenizer files
 
 class MMap {
 
     size_t size;
     void* data;
     char* cur; // pointer arithmetic on void* is not standard
+    char* eof;
 
 public:
-    MMap(const string& file_str) {
+    MMap(const string& file_path) {
         struct stat fileInfo;
-        const char* file = file_str.c_str();
+        const char* file = file_path.c_str();
         int fd = open(file, O_RDONLY);
         if (fd == -1 || stat(file, &fileInfo) == -1) {
-            cerr << "Couldn't open file " << file_str << endl;
+            cerr << "Couldn't open file " << file_path << endl;
             exit(EXIT_FAILURE);
         }
         data = mmap(NULL, fileInfo.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -49,15 +50,17 @@ public:
         }
         cur = static_cast<char*>(data);
         size = fileInfo.st_size;
-        close(fd); // we can close the file once mapped
+        eof = cur + size;
+        close(fd); // we can close the file after mapping
     }
    ~MMap() { munmap(data, size); }
 
+    // return a pointer to current position and update the read pointer
     template<typename T = float>
     T* next(size_t n = 1) {
         T* ptr = reinterpret_cast<T*>(cur);
         cur += n * sizeof(T);
-        if (cur > (char*)data + size) {
+        if (cur > eof) {
             cerr << "Mapping after end of file!" << endl;
             exit(EXIT_FAILURE);
         }
@@ -73,7 +76,7 @@ template <size_t N> struct Array;
 template<>
 struct Array<1> {
 
-   ~Array() { if (!mem_mapped) { free(base); } }
+   ~Array() { if (!mapped) free(base); }
 
     // implicit decay to pointer as a native C array
     operator float*() const { return base; }
@@ -83,18 +86,18 @@ struct Array<1> {
     float* operator()(size_t x) { return base + addr(x); }
 
     void alloc(size_t n) {
-        if (!mem_mapped) {
+        if (!mapped) {
             // we calloc instead of malloc to keep valgrind happy
             base = (float*)calloc(n, sizeof(float));
             if (!base) {
-                cerr << "Cannot allocate run state!" << endl;
+                cerr << "Cannot allocate Transformer!" << endl;
                 exit(EXIT_FAILURE);
             }
         }
     }
 
     float* base = NULL;
-    bool mem_mapped = false;
+    bool mapped = false;
 };
 
 // Helper to multiply args with a fold expressions
@@ -149,34 +152,34 @@ struct Transformer {
     // (optional) classifier weights for the logits, on the last layer
     float* wcls;
 
-    // Current wave of activations
-    Array<1> x;   // activation at current time stamp (dim,)
-    Array<2> xb;  // same, but inside a residual branch (dim,)
-    Array<1> xb2; // an additional buffer just for convenience (dim,)
-    Array<1> hb;  // buffer for hidden dimension in the ffn (hidden_dim,)
-    Array<1> hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
-    Array<2> query; // query (dim,)
-    Array<2> key;   // key (kv_dim,)
-    Array<2> value; // value (kv_dim,)
+    // current wave of activations
+    Array<1> x;         // activation at current time stamp (dim,)
+    Array<2> xb;        // same, but inside a residual branch (dim,)
+    Array<1> xb2;       // an additional buffer just for convenience (dim,)
+    Array<1> hb;        // buffer for hidden dimension in the ffn (hidden_dim,)
+    Array<1> hb2;       // buffer for hidden dimension in the ffn (hidden_dim,)
+    Array<2> query;     // query (n_heads, head_size)
+    Array<1> key;       // key (kv_dim,)
+    Array<1> value;     // value (kv_dim,)
     Array<2> attention; // buffer for scores/attention values (n_heads, seq_len)
-    Array<1> logits; // output logits (vocab_size)
-    // Key and Value cache
+    Array<1> logits;    // output logits (vocab_size)
+    // key and value cache
     Array<4> key_cache;   // (layer, seq_len, n_kv_heads, head_size)
     Array<4> value_cache; // (layer, seq_len, n_kv_heads, head_size)
-    Array<2> freq_cis; // (seq_len, head_size);
+    Array<2> freq_cis;    // (seq_len, head_size);
 
     MMap mmap;
 
-    Transformer(const string& model_file);
-    float* forward(int token, int pos);
-
-    // Helper to map an Array into a memory mapped file
+    // map an Array on a MMap object
     template<size_t N, typename... Args>
     void map_array(Array<N>& a, Args... args) {
         a.base = mmap.next(argmul(args...));
-        a.mem_mapped = true; // prevent new memory allocation
+        a.mapped = true; // prevent new memory allocation
         a.alloc(args...);
     }
+
+    Transformer(const string& model_file);
+    float* forward(int token, int pos);
 };
 
 Transformer::Transformer(const string& model_file) : mmap(model_file) {
@@ -196,6 +199,7 @@ Transformer::Transformer(const string& model_file) : mmap(model_file) {
 
     // memory map the Transformer weights into the data pointer
     int head_size = dim / n_heads;
+    int kv_dim = n_kv_heads * head_size;
 
     map_array(token_embedding_table, vocab_size, dim);
     map_array(rms_att_weight, n_layers, dim);
@@ -221,8 +225,8 @@ Transformer::Transformer(const string& model_file) : mmap(model_file) {
     hb.alloc(hidden_dim);
     hb2.alloc(hidden_dim);
     query.alloc(n_heads, head_size);
-    key.alloc(n_kv_heads, head_size);
-    value.alloc(n_kv_heads, head_size);
+    key.alloc(kv_dim);
+    value.alloc(kv_dim);
     attention.alloc(n_heads, seq_len);
     logits.alloc(vocab_size);
     key_cache.alloc(n_layers, seq_len, n_kv_heads, head_size);
@@ -305,9 +309,9 @@ void complexmul(float* a, float* b, float c, float d) {
 float* Transformer::forward(int token, int pos) {
 
     // a few convenience variables
-    int kv_dim = (dim * n_kv_heads) / n_heads;
-    int kv_mul = n_heads / n_kv_heads; // integer multiplier of the kv sharing in multiquery
     int head_size = dim / n_heads;
+    int kv_dim = n_kv_heads * head_size;
+    int kv_mul = dim / kv_dim; // integer multiplier of the kv sharing in multiquery
 
     // copy the token embedding into x
     memcpy(x, token_embedding_table(token), dim * sizeof(float));
@@ -318,7 +322,7 @@ float* Transformer::forward(int token, int pos) {
     // forward all the layers
     for (int l = 0; l < n_layers; l++) {
 
-        // attention rmsnorm (Root Mean Square normalization)
+        // attention rmsnorm (Root Mean Square Normalization)
         rmsnorm(xb, x, rms_att_weight(l), dim);
 
         // qkv matmuls for this position (V X M = V)
@@ -334,7 +338,7 @@ float* Transformer::forward(int token, int pos) {
             int k = (h % head_size);
             complexmul(query+h, query+h+1, freq[k], freq[k+1]);
             if (h < kv_dim) {
-                complexmul(key+h, key+h+1, freq[k], freq[k+1]);
+                complexmul(key(h), key(h+1), freq[k], freq[k+1]);
             }
         }
 
@@ -430,7 +434,7 @@ float* Transformer::forward(int token, int pos) {
 
 struct Tokenizer {
 
-    Tokenizer(const string& tokenizer_file, int vocab_size);
+    Tokenizer(const string& tokenizer_path, int vocab_size);
     int str_lookup(const string& str);
     void encode(vector<int>* tokens_ptr, const string& text);
     string decode(int prev_token, int token);
@@ -442,9 +446,9 @@ struct Tokenizer {
     map<string, int> sorted_vocab;
 };
 
-Tokenizer::Tokenizer(const string& tokenizer_file, int vocab_size) : mmap(tokenizer_file) {
+Tokenizer::Tokenizer(const string& tokenizer_path, int vocab_size) : mmap(tokenizer_path) {
 
-    // Read in the tokenizer .bin file
+    // read in the tokenizer .bin file
     mmap.next<float>(); // ignore max_token_length
     for (int i = 0; i < vocab_size; i++) {
         float score = *mmap.next<float>();
@@ -480,8 +484,8 @@ int Tokenizer::str_lookup(const string& str) {
 }
 
 void Tokenizer::encode(vector<int>* tokens_ptr, const string& text) {
-    // encode the string text (input) into an upper-bound preallocated tokens[] array
 
+    // encode the string text (input) into tokens[] vector
     vector<int>& tokens = *tokens_ptr; // syntactic sugar
     string str;
 
@@ -581,20 +585,19 @@ float random_f32(unsigned long long* state) { // random float32 in [0,1)
     return (random_u32(state) >> 8) / 16777216.0f;
 }
 
-// top-p sampling (or "nucleus sampling") samples from the smallest set of
-// tokens that exceed probability topp. This way we never sample tokens that
-// have very low probabilities and are less likely to go "off the rails".
-// coin is a random number in [0, 1), usually from random_f32()
-//
-// if topp <= 0 or > 1 simply sample from the predicted probability distribution
 int Sampler::sample_topp(float* prob, float coin) {
-
+    // top-p sampling (or "nucleus sampling") samples from the smallest set of
+    // tokens that exceed probability topp. This way we never sample tokens that
+    // have very low probabilities and are less likely to go "off the rails".
+    // coin is a random number in [0, 1), usually from random_f32()
     vector<int> v;
     v.reserve(vocab_size);
     float cumulative_prob = 1.0f;
 
-    if (topp <= 0 || topp > 1)
+    if (topp <= 0 || topp > 1) {
+        // sample from the predicted probability distribution
         topp = 1.0f;
+    }
 
     // values smaller than (1 - topp) / (n - 1) cannot be part of the result
     // so for efficiency we crop these out as candidates before sorting
@@ -632,20 +635,20 @@ int Sampler::sample_topp(float* prob, float coin) {
 }
 
 int Sampler::sample(float* logits) {
+
     // sample the token given the logits and some hyperparameters
     int next;
     if (temperature == 0.0f) {
         // greedy argmax sampling: take the token with the highest probability
         next = argmax(logits, vocab_size);
     } else {
-        // apply softmax to the logits to get the probabilities for next token
+        // apply softmax with temperature to the logits to get the probabilities for next token
         softmax(logits, vocab_size, temperature);
 
         // flip a (float) coin (this is our source of entropy for sampling)
         float coin = random_f32(&rng_state);
 
-        // we sample from this distribution to get the next token
-        // if topp > 0 we (also) perform top-p (nucleus) sampling, clamping the least likely
+        // if topp > 0 we perform top-p (nucleus) sampling, clamping the least likely
         // tokens to zero. Othewise sample from the predicted probability distribution.
         next = sample_topp(logits, coin);
     }
@@ -665,12 +668,12 @@ long time_in_ms() {
 // ----------------------------------------------------------------------------
 // generation loop
 
-void generate(Transformer& t, Tokenizer& tok, Sampler& sampler, const string& prompt, int steps) {
+void generate(Transformer& transformer, Tokenizer& tokenizer, Sampler& sampler, const string& prompt, int steps) {
 
     // encode the (string) prompt into tokens sequence, if any is given
     vector<int> prompt_tokens;
     if (!prompt.empty())
-        tok.encode(&prompt_tokens, prompt);
+        tokenizer.encode(&prompt_tokens, prompt);
 
     // start the main loop
     long start = 0;  // used to time our code, only initialized after first iteration
@@ -681,7 +684,7 @@ void generate(Transformer& t, Tokenizer& tok, Sampler& sampler, const string& pr
     while (pos < steps) {
 
         // forward the transformer to get logits for the next token
-        float* logits = t.forward(token, pos);
+        float* logits = transformer.forward(token, pos);
 
         // advance the state machine
         if (pos < (int)prompt_tokens.size()) {
@@ -699,7 +702,7 @@ void generate(Transformer& t, Tokenizer& tok, Sampler& sampler, const string& pr
             break;
 
         // print the token as string, decode it with the Tokenizer object
-        string next_str = tok.decode(token, next);
+        string next_str = tokenizer.decode(token, next);
         cout << next_str << std::flush;
         token = next;
 
