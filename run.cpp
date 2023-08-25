@@ -798,23 +798,22 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // build the Transformer via the model .bin file
+    Transformer transformer(checkpoint_path);
+
     // parameter validation/overrides
     if (rng_seed <= 0) rng_seed = (unsigned int)time(NULL);
     if (temperature < 0.0) temperature = 0.0;
     if (topp < 0.0 || 1.0 < topp) topp = 0.9;
-    if (steps < 0) steps = 0;
-
-    // build the Transformer via the model .bin file
-    Transformer transformer(checkpoint_path);
-    if (steps == 0) steps = transformer.seq_len; // ovrerride to ~max length
-
-    print_model_info(transformer);
+    if (steps <= 0 || steps > transformer.seq_len) steps = transformer.seq_len; // ovrerride to ~max length
 
     // build the Tokenizer via the tokenizer .bin file
     Tokenizer tokenizer(tokenizer_path, transformer.vocab_size);
 
     // build the Sampler
     Sampler sampler(transformer.vocab_size, temperature, topp, rng_seed);
+
+    print_model_info(transformer);
 
     // run!
     generate(transformer, tokenizer, sampler, prompt, steps);
