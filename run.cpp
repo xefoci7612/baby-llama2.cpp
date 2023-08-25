@@ -1,4 +1,4 @@
-/* Inference for Llama-2 Transformer model in pure C/C++ */
+/* Inference for Llama-2 Transformer model in C/C++ */
 
 #include <algorithm>
 #include <cctype>
@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <iostream>
 #include <map>
+#include <string>
 #include <vector>
 #include <sys/stat.h>
 
@@ -680,31 +681,60 @@ long time_in_ms() {
 }
 
 // ----------------------------------------------------------------------------
-// generation loop
+// generation/chat loop
 
-void generate(Transformer& transformer, Tokenizer& tokenizer, Sampler& sampler, const string& prompt, int steps) {
-
-    // encode the (string) prompt into tokens sequence
-    vector<int> prompt_tokens;
-    tokenizer.encode(&prompt_tokens, prompt, true, false);
-    if (prompt_tokens.size() < 1) {
-        cerr << "something is wrong, expected at least 1 prompt token" << endl;
-        exit(EXIT_FAILURE);
-    }
+void generate(Transformer& transformer, Tokenizer& tokenizer, Sampler& sampler,
+              string prompt, string system_prompt, bool is_chat, int steps) {
 
     // start the main loop
+    vector<int> prompt_tokens;
     long start = 0;  // used to time our code, only initialized after first iteration
-    int next;        // will store the next token in the sequence
-    int token = prompt_tokens[0]; // kick off with the first token in the prompt
-    int pos = 0;     // position in the sequence
+    bool user_turn = true; // user starts, in generate mode process the prompt
+    int token;   // will store the current/prev token in the sequence
+    int next;    // will store the next token in the sequence
+    int pos = 0; // position in the sequence
+    int prompt_end; // position of the end of the user prompt
 
     while (pos < steps) {
+
+        // when it is the user's turn to contribute tokens to the dialog...
+        if (user_turn) {
+
+            if (is_chat) {
+                // get the user prompt
+                if (prompt.empty()) {
+                    cout << "User: ";
+                    if (!getline(cin, prompt))
+                        return; // broken pipe, exit
+                }
+                // render user/system prompts into the Llama 2 Chat schema
+                if (!system_prompt.empty()) {
+                    prompt = string("[INST] <<SYS>>\n") + system_prompt + "\n<</SYS>>\n\n" + prompt + " [/INST]";
+                } else {
+                    prompt = string("[INST] ") + prompt + " [/INST]";
+                }
+                cout << "Assistant: ";
+            }
+
+            // encode the (string) prompt into tokens sequence
+            tokenizer.encode(&prompt_tokens, prompt, true, false);
+            if (prompt_tokens.size() < 1) {
+                cerr << "something is wrong, expected at least 1 prompt token" << endl;
+                exit(EXIT_FAILURE);
+            }
+            token = prompt_tokens[0]; // kick off with the first token in the prompt
+            prompt_end = pos + prompt_tokens.size() - 1; // first token is already grabbed
+
+            // reset stuff
+            user_turn = false;
+            prompt = system_prompt = ""; // mark as consumed
+        }
 
         // forward the transformer to get logits for the next token
         float* logits = transformer.forward(token, pos);
 
         // advance the state machine
-        if (pos < (int)prompt_tokens.size() - 1) {
+        if (pos < prompt_end) {
             // if we are still processing the input prompt, force the next prompt token
             next = prompt_tokens[pos + 1];
         } else {
@@ -715,12 +745,22 @@ void generate(Transformer& transformer, Tokenizer& tokenizer, Sampler& sampler, 
         pos++; // increment before a possible early exit due to a BOS token
 
         // data-dependent terminating condition: the BOS token delimits sequences
-        if (next == BOS)
+        if (next == BOS && !is_chat)
             break;
 
         // print the token as string, decode it with the Tokenizer object
-        string next_str = tokenizer.decode(token, next);
-        cout << next_str << std::flush;
+        // in chat mode print only the Assistant response
+        if ((pos >= prompt_end && next != EOS) || !is_chat) {
+            string next_str = tokenizer.decode(token, next);
+            cout << next_str << std::flush;
+        }
+
+        // EOS token ends the Assistant turn
+        if (next == EOS && is_chat) {
+            user_turn = true;
+            cout << endl;
+        }
+
         token = next;
 
         // init the timer here because the first iteration can be slower
@@ -729,8 +769,8 @@ void generate(Transformer& transformer, Tokenizer& tokenizer, Sampler& sampler, 
     }
     cout << endl;
 
-    // report achieved tok/s (pos-1 because the timer starts after first iteration)
-    if (pos > 1) {
+    // Generate: report achieved tok/s (pos-1 because the timer starts after first iteration)
+    if (pos > 1 && !is_chat) {
         long elapsed = time_in_ms() - start;
         cerr << "\nachieved tok/s: " << (pos-1) / (double)(elapsed)*1000 << endl;
     }
@@ -761,7 +801,9 @@ void error_usage() {
             "  -s <int>    random seed, default time(NULL)\n"
             "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n"
             "  -i <string> input prompt\n"
-            "  -z <string> optional path to custom tokenizer\n" << endl;
+            "  -z <string> optional path to custom tokenizer\n"
+            "  -m <string> mode: generate|chat, default: generate\n"
+            "  -y <string> (optional) system prompt in chat mode\n" << endl;
     exit(EXIT_FAILURE);
 }
 
@@ -775,6 +817,8 @@ int main(int argc, char* argv[]) {
     int steps = 256;          // number of steps to run for
     string prompt;            // prompt string
     unsigned long long rng_seed = 0; // seed rng with time by default
+    string mode = "generate"; // generate|chat
+    string system_prompt;     // the (optional) system prompt to use in chat mode
 
     // 'checkpoint' is necessary, optional arguments and their values
     // come in pairs, so argc must be even.
@@ -793,6 +837,8 @@ int main(int argc, char* argv[]) {
             else if (opt[i] == "-n") steps = stoi(opt[i+1]);
             else if (opt[i] == "-i") prompt = opt[i+1];
             else if (opt[i] == "-z") tokenizer_path = opt[i+1];
+            else if (opt[i] == "-m") mode = opt[i+1];
+            else if (opt[i] == "-y") system_prompt = opt[i+1];
             else
                 error_usage();
         }
@@ -806,6 +852,19 @@ int main(int argc, char* argv[]) {
     if (temperature < 0.0) temperature = 0.0;
     if (topp < 0.0 || 1.0 < topp) topp = 0.9;
     if (steps <= 0 || steps > transformer.seq_len) steps = transformer.seq_len; // ovrerride to ~max length
+    if (mode != "generate" && mode != "chat") {
+        cerr << "unknown mode: " << mode << endl;
+        error_usage();
+    }
+
+    // try to get a system prompt
+    bool is_chat = (mode == "chat");
+    if (is_chat && system_prompt.empty()) {
+        // system prompt was not passed in, attempt to get it from stdin
+        cout << "Enter system prompt (optional): ";
+        if (!getline(cin, system_prompt))
+            return 0; // broken pipe, exit
+    }
 
     // build the Tokenizer via the tokenizer .bin file
     Tokenizer tokenizer(tokenizer_path, transformer.vocab_size);
@@ -816,7 +875,7 @@ int main(int argc, char* argv[]) {
     print_model_info(transformer);
 
     // run!
-    generate(transformer, tokenizer, sampler, prompt, steps);
+    generate(transformer, tokenizer, sampler, prompt, system_prompt, is_chat, steps);
 
     return 0;
 }
