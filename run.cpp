@@ -71,7 +71,7 @@ public:
 };
 
 // ----------------------------------------------------------------------------
-// A dynamic multi-dimensional array M(x,y) -> &M[x][y], M(x) -> M[x][...]
+// A simple dynamic multi-dimensional array M(x,y) -> &M[x][y], M(x) -> M[x][...]
 
 template <size_t N> struct Array;
 
@@ -84,8 +84,7 @@ struct Array<1> {
     operator float*() const { return base; }
 
     // return a pointer to the indexed item
-    size_t addr(size_t x) { return x; } // used by derived classes
-    float* operator()(size_t x) { return base + addr(x); }
+    float* operator()(size_t x = 0) { return base + x; }
 
     void alloc(size_t n) {
         if (!mapped) {
@@ -110,15 +109,12 @@ template <size_t N>
 struct Array : Array<N-1> {
 
     template<typename... Args>
+    float* operator()(size_t x, Args... args) { return Array<N-1>::operator()(args...) + d * x; }
+
+    float* operator()() { return this->base; }
+
+    template<typename... Args>
     void alloc(size_t a, size_t b, Args... args) { d = b * argmul(args...); Array<N-1>::alloc(a * b, args...); }
-
-    size_t addr(size_t x) { return d * x; }
-
-    template<typename... Args>
-    size_t addr(size_t x, Args... args) { return d * x + Array<N-1>::addr(args...); }
-
-    template<typename... Args>
-    float* operator()(Args... args) { return this->base + addr(args...); }
 
     size_t d;
 };
@@ -689,16 +685,16 @@ void generate(Transformer& transformer, Tokenizer& tokenizer, Sampler& sampler,
     // start the main loop
     vector<int> prompt_tokens;
     long start = 0;  // used to time our code, only initialized after first iteration
-    bool user_turn = true; // user starts, in generate mode process the prompt
     int token;   // will store the current/prev token in the sequence
     int next;    // will store the next token in the sequence
     int pos = 0; // position in the sequence
-    int prompt_end; // position of the end of the user prompt
+    int prompt_end; // position at the end of user prompt
+    bool is_user_turn = true; // when in chat mode, user starts
 
     while (pos < steps) {
 
         // when it is the user's turn to contribute tokens to the dialog...
-        if (user_turn) {
+        if (is_user_turn) {
 
             if (is_chat) {
                 // get the user prompt
@@ -726,7 +722,7 @@ void generate(Transformer& transformer, Tokenizer& tokenizer, Sampler& sampler,
             prompt_end = pos + prompt_tokens.size() - 1; // first token is already grabbed
 
             // reset stuff
-            user_turn = false;
+            is_user_turn = false;
             prompt = system_prompt = ""; // mark as consumed
         }
 
@@ -749,7 +745,7 @@ void generate(Transformer& transformer, Tokenizer& tokenizer, Sampler& sampler,
             break;
 
         // print the token as string, decode it with the Tokenizer object
-        // in chat mode print only the Assistant response
+        // when in chat mode print only the Assistant response
         if ((pos >= prompt_end && next != EOS) || !is_chat) {
             string next_str = tokenizer.decode(token, next);
             cout << next_str << std::flush;
@@ -757,7 +753,7 @@ void generate(Transformer& transformer, Tokenizer& tokenizer, Sampler& sampler,
 
         // EOS token ends the Assistant turn
         if (next == EOS && is_chat) {
-            user_turn = true;
+            is_user_turn = true;
             cout << endl;
         }
 
