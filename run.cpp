@@ -27,6 +27,20 @@ static const int BOS = 1; // sentencepiece BOS token
 static const int EOS = 2; // sentencepiece EOS token
 
 // ----------------------------------------------------------------------------
+// Base struct for int8_t grouped quantization facility
+
+static const int GS = 32; // group number
+
+struct QuantizedTensor {
+    int8_t* q; // quantized values
+    float* s;  // scaling factors, they are GS times less than values
+};
+
+QuantizedTensor operator+(const QuantizedTensor& qt, size_t n) {
+    return QuantizedTensor{ qt.q + n, qt.s + (n / GS) };
+}
+
+// ----------------------------------------------------------------------------
 // Memory mapping facility to load and read model and tokenizer files
 
 class MMap {
@@ -70,8 +84,6 @@ public:
     }
 };
 
-static const int GS = 32;
-
 // ----------------------------------------------------------------------------
 // A simple dynamic multi-dimensional array M(x,y) -> &M[x][y], M(x) -> M[x][...]
 
@@ -83,66 +95,73 @@ struct Array<1, T> {
    ~Array() { if (!mapped) free(base); }
 
     // implicit decay to pointer as a native C array
-    operator T*() const { return base; }
+    operator T() const { return base; }
 
     // return a pointer to the indexed item
-    T* operator()(size_t x = 0) { return base + x; }
+    T operator()(size_t x = 0) { return base + x; }
 
     void alloc(size_t n) {
         if (!mapped) {
             // we calloc instead of malloc to keep valgrind happy
-            base = (T*)calloc(n, sizeof(T));
+            base = (T)calloc(n, sizeof(float)); // FIXME std::remove_pointer<T>::type;
             if (!base) {
                 cerr << "Cannot allocate Transformer!" << endl;
                 exit(EXIT_FAILURE);
             }
         }
+        size = n;
     }
 
-    T* base = NULL;
+    T base = NULL;
     bool mapped = false;
+    size_t size = 0;
 };
-
-struct QuantizedTensor {
-    Array<1, int8_t> q; // quantized values
-    Array<1, float> s;  // scaling factors
-};
-
-template <size_t N>
-using QArray = Array<N, QuantizedTensor>;
 
 template<>
 struct Array<1, QuantizedTensor> {
 
-    // implicit decay to pointer as a native C array
-    operator QuantizedTensor*() const { return base; }
-
-    // return a pointer to the indexed item
-    QuantizedTensor* operator()(size_t x = 0) { return base + x; }
-
-    void alloc(size_t n) {
+   ~Array() {
         if (!mapped) {
-            qt.q.alloc(n);
-            qt.s.alloc(n / GS); // scaling factors are GS time less than values
+            free(base.q);
+            free(base.s);
         }
     }
 
-    QuantizedTensor qt;
-    QuantizedTensor* base = &qt;
+    // implicit decay to pointer as a native C array
+    operator QuantizedTensor() const { return base; }
+
+    // return a pointer to the indexed item
+    QuantizedTensor operator()(size_t x = 0) { return base + x; }
+
+    void alloc(size_t n) {
+        if (!mapped) {
+            // we calloc instead of malloc to keep valgrind happy
+            base.q = (int8_t*)calloc(n, sizeof(int8_t));
+            base.s = (float*)calloc(n / GS, sizeof(float)); // scaling factors are GS time less than values
+            if (!base.q || !base.s) {
+                cerr << "Cannot allocate Transformer!" << endl;
+                exit(EXIT_FAILURE);
+            }
+        }
+        size = n;
+    }
+
+    QuantizedTensor base;
     bool mapped = false;
+    size_t size = 0;
 };
 
 // Helper to multiply args with a fold expressions
 template<typename... Args>
 size_t argmul(Args... args) { return (size_t(1) * ... * args); }
 
-template <size_t N, typename T = float>
+template <size_t N, typename T = float*>
 struct Array : Array<N-1,T> {
 
     template<typename... Args>
-    float* operator()(size_t x, Args... args) { return Array<N-1,T>::operator()(args...) + d * x; }
+    T operator()(size_t x, Args... args) { return Array<N-1,T>::operator()(args...) + d * x; }
 
-    float* operator()() { return this->base; }
+    T operator()() { return this->base; }
 
     template<typename... Args>
     void alloc(size_t a, size_t b, Args... args) { d = b * argmul(args...); Array<N-1,T>::alloc(a * b, args...); }
@@ -150,11 +169,21 @@ struct Array : Array<N-1,T> {
     size_t d;
 };
 
-void quantize(QuantizedTensor* qx, float* x, int n) {
+// ----------------------------------------------------------------------------
+// Quantization functions
+
+template <size_t N>
+using QArray = Array<N, QuantizedTensor>;
+
+void quantize(QArray<1>& qarray, float* x) {
+    QuantizedTensor qx = qarray;
+    int n = qarray.size;
     int num_groups = n / GS;
     float Q_MAX = 127.0f;
 
-    for (int group = 0; group < num_groups; group++) {
+    int group;
+    #pragma omp parallel for private(group)
+    for (group = 0; group < num_groups; group++) {
 
         // find the max absolute value in the current group
         float wmax = 0.0;
@@ -167,20 +196,22 @@ void quantize(QuantizedTensor* qx, float* x, int n) {
 
         // calculate and write the scaling factor
         float scale = wmax / Q_MAX;
-        qx->s[group] = scale;
+        qx.s[group] = scale;
 
-        // calculate and write the quantized values
+        // // calculate and write the quantized values
         for (int i = 0; i < GS; i++) {
             float quant_value = x[group * GS + i] / scale; // scale
             int8_t quantized = (int8_t) round(quant_value); // round and clamp
-            qx->q[group * GS + i] = quantized;
+            qx.q[group * GS + i] = quantized;
         }
     }
 }
 
-void dequantize(QuantizedTensor* qx, float* x, int n) {
+void dequantize(QArray<1>& qarray, float* x) {
+    QuantizedTensor qx = qarray;
+    int n = qarray.size;
     for (int i = 0; i < n; i++) {
-        x[i] = qx->q[i] * qx->s[i / GS];
+        x[i] = qx.q[i] * qx.s[i / GS];
     }
 }
 
@@ -197,6 +228,7 @@ struct Transformer {
     int32_t seq_len;    // max sequence length
 
     // token embedding table
+    Array<2> token_embedding_table_disk; // (vocab_size, dim) will be retired!
     Array<2> token_embedding_table; // (vocab_size, dim)
     // weights for rmsnorms
     Array<2> rms_att_weight; // (layer, dim)
@@ -231,9 +263,29 @@ struct Transformer {
     Array<4> value_cache; // (layer, seq_len, n_kv_heads, head_size)
     Array<2> freq_cis;    // (seq_len, head_size);
 
-    // quantized vectors: token embedding table
+    // --------------------------------------------------------------------------
+    // QuantizedTensors
+    //
+    // token embedding table
     QArray<2> q_token_embedding_table; // (vocab_size, dim)
-    Array <2> dq_token_embedding_table; // dequantized table
+
+    // weights for matmuls. note dim == n_heads * head_size
+    QArray<4> q_wq; // (layer, dim, n_heads, head_size)
+    QArray<4> q_wk; // (layer, dim, n_kv_heads, head_size)
+    QArray<4> q_wv; // (layer, dim, n_kv_heads, head_size)
+    QArray<4> q_wo; // (layer, n_heads, head_size, dim)
+
+    // weights for ffn
+    QArray<3> q_w1; // (layer, hidden_dim, dim)
+    QArray<3> q_w2; // (layer, dim, hidden_dim)
+    QArray<3> q_w3; // (layer, hidden_dim, dim)
+
+    // (optional) classifier weights for the logits, on the last layer
+    QArray<2>* q_wcls;
+
+    QArray<1> q_x;  // quantized x (dim,)
+    QArray<1> q_hb; // quantized hb (hidden_dim,)
+    // --------------------------------------------------------------------------
 
     MMap mmap;
 
@@ -268,7 +320,7 @@ Transformer::Transformer(const string& model_file) : mmap(model_file) {
     int head_size = dim / n_heads;
     int kv_dim = n_kv_heads * head_size;
 
-    map_array(token_embedding_table, vocab_size, dim);
+    map_array(token_embedding_table_disk, vocab_size, dim);
     map_array(rms_att_weight, n_layers, dim);
     map_array(wq, n_layers, dim, n_heads, head_size);
     map_array(wk, n_layers, dim, n_kv_heads, head_size);
@@ -283,7 +335,7 @@ Transformer::Transformer(const string& model_file) : mmap(model_file) {
     mmap.next(seq_len * head_size / 2); // skip what used to be freq_cis_real (for RoPE)
     mmap.next(seq_len * head_size / 2); // skip what used to be freq_cis_imag (for RoPE)
 
-    wcls = shared_weights ? token_embedding_table : mmap.next(vocab_size * dim);
+    wcls = shared_weights ? token_embedding_table_disk : mmap.next(vocab_size * dim);
 
     // allocate the run-state buffers
     x.alloc(dim);
@@ -299,12 +351,40 @@ Transformer::Transformer(const string& model_file) : mmap(model_file) {
     key_cache.alloc(n_layers, seq_len, n_kv_heads, head_size);
     value_cache.alloc(n_layers, seq_len, n_kv_heads, head_size);
     freq_cis.alloc(seq_len, head_size);
+    token_embedding_table.alloc(vocab_size, dim);
 
-    // allocate and populate quantized vectors
+    // --------------------------------------------------------------------------
+    // QuantizedTensors
+    //
     q_token_embedding_table.alloc(vocab_size, dim);
-    quantize(q_token_embedding_table, token_embedding_table, vocab_size * dim);
-    dq_token_embedding_table.alloc(vocab_size, dim);
-    dequantize(q_token_embedding_table, dq_token_embedding_table, vocab_size * dim);
+    quantize(q_token_embedding_table, token_embedding_table_disk);
+
+    q_x.alloc(dim);
+    q_hb.alloc(hidden_dim);
+
+    q_wq.alloc(n_layers, dim, n_heads, head_size);
+    q_wk.alloc(n_layers, dim, n_kv_heads, head_size);
+    q_wv.alloc(n_layers, dim, n_kv_heads, head_size);
+    q_wo.alloc(n_layers, n_heads, head_size, dim);
+
+    quantize(q_wq, wq);
+    quantize(q_wk, wk);
+    quantize(q_wv, wv);
+    quantize(q_wo, wo);
+
+    q_w1.alloc(n_layers, hidden_dim, dim);
+    q_w2.alloc(n_layers, dim, hidden_dim);
+    q_w3.alloc(n_layers, hidden_dim, dim);
+
+    quantize(q_w1, w1);
+    quantize(q_w2, w2);
+    quantize(q_w3, w3);
+
+    q_wcls = &q_token_embedding_table;
+    // --------------------------------------------------------------------------
+
+    // use full expanded version in transformer
+    dequantize(q_token_embedding_table, token_embedding_table);
 
     // compute freq_cis
     float* ptr = freq_cis;
@@ -372,6 +452,33 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
     }
 }
 
+void matmul(float* xout, const QuantizedTensor& x, const QuantizedTensor& w, int n, int d) {
+    // W (d,n) @ x (n,) -> xout (d,)
+    // by far the most amount of time is spent inside this little function
+    // inputs to this function are both quantized
+
+    int i;
+    #pragma omp parallel for private(i)
+    for (i = 0; i < d; i++) {
+
+        float val = 0.0f;
+        int32_t ival = 0;
+        int in = i * n;
+
+        // do the matmul in groups of GS
+        int j;
+        for (j = 0; j <= n - GS; j += GS) {
+            for (int k = 0; k < GS; k++) {
+                ival += ((int32_t) x.q[j + k]) * ((int32_t) w.q[in + j + k]);
+            }
+            val += ((float) ival) * w.s[(in + j) / GS] * x.s[j / GS];
+            ival = 0;
+        }
+
+        xout[i] = val;
+    }
+}
+
 void complexmul(float* a, float* b, float c, float d) {
     // (a+ib)(c+id) -> (ac-bd) + i(ad+bd)
     float a0 = *a;
@@ -387,8 +494,7 @@ float* Transformer::forward(int token, int pos) {
     int kv_mul = dim / kv_dim; // integer multiplier of the kv sharing in multiquery
 
     // copy the token embedding into x
-    //memcpy(x, token_embedding_table(token), dim * sizeof(float));
-    memcpy(x, dq_token_embedding_table(token), dim * sizeof(float));
+    memcpy(x, token_embedding_table(token), dim * sizeof(float));
 
     // pluck out the "pos" row of freq_cis
     float* freq = freq_cis(pos);
@@ -400,9 +506,10 @@ float* Transformer::forward(int token, int pos) {
         rmsnorm(xb, x, rms_att_weight(l), dim);
 
         // qkv matmuls for this position (V X M = V)
-        matmul(query, xb, wq(l), dim, dim);
-        matmul(key, xb, wk(l), dim, kv_dim);
-        matmul(value, xb, wv(l), dim, kv_dim);
+        quantize(q_x, xb);
+        matmul(query, q_x, q_wq(l), dim, dim);
+        matmul(key, q_x, q_wk(l), dim, kv_dim);
+        matmul(value, q_x, q_wv(l), dim, kv_dim);
 
         // RoPE relative positional encoding: complex-valued
         // rotate query and key by freq in each head
@@ -461,7 +568,8 @@ float* Transformer::forward(int token, int pos) {
         }
 
         // final matmul to get the output of the attention
-        matmul(xb2, xb, wo(l), dim, dim);
+        quantize(q_x, xb);
+        matmul(xb2, q_x, q_wo(l), dim, dim);
 
         // residual connection back into x
         for (int i = 0; i < dim; i++) {
@@ -473,8 +581,9 @@ float* Transformer::forward(int token, int pos) {
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
-        matmul(hb, xb, w1(l), dim, hidden_dim);
-        matmul(hb2, xb, w3(l), dim, hidden_dim);
+        quantize(q_x, xb);
+        matmul(hb, q_x, q_w1(l), dim, hidden_dim);
+        matmul(hb2, q_x, q_w3(l), dim, hidden_dim);
 
         // SwiGLU non-linearity
         for (int i = 0; i < hidden_dim; i++) {
@@ -487,7 +596,8 @@ float* Transformer::forward(int token, int pos) {
         }
 
         // final matmul to get the output of the ffn
-        matmul(xb, hb, w2(l), hidden_dim, dim);
+        quantize(q_hb, hb);
+        matmul(xb, q_hb, q_w2(l), hidden_dim, dim);
 
         // residual connection
         for (int i = 0; i < dim; i++) {
@@ -499,7 +609,8 @@ float* Transformer::forward(int token, int pos) {
     rmsnorm(x, x, rms_final_weight, dim);
 
     // classifier into logits
-    matmul(logits, x, wcls, dim, vocab_size);
+    quantize(q_x, x);
+    matmul(logits, q_x, *q_wcls, dim, vocab_size);
     return logits;
 }
 
