@@ -27,7 +27,7 @@ static const int BOS = 1; // sentencepiece BOS token
 static const int EOS = 2; // sentencepiece EOS token
 
 // ----------------------------------------------------------------------------
-// Base struct for int8_t grouped quantization facility
+// Base struct for int8_t grouped quantization
 
 static const int GS = 32; // group number
 
@@ -85,68 +85,55 @@ public:
 };
 
 // ----------------------------------------------------------------------------
+// Low level memory allocation/release functions
+
+bool do_alloc(float** base, size_t n) {
+    // we calloc instead of malloc to keep valgrind happy
+    *base = (float*)calloc(n, sizeof(float));
+    return *base != NULL;
+}
+
+bool do_alloc(QuantizedTensor* base, size_t n) {
+    // scaling factors are GS time less than values
+    base->q = (int8_t*)calloc(n, sizeof(int8_t));
+    base->s = (float*)calloc(n / GS, sizeof(float));
+    return base->q != NULL && base->s != NULL;
+}
+
+void do_free(float* base) { free(base); }
+void do_free(QuantizedTensor& base) { free(base.q); free(base.s); }
+
+// ----------------------------------------------------------------------------
 // A simple dynamic multi-dimensional array M(x,y) -> &M[x][y], M(x) -> M[x][...]
+// used for both float* and QuantizedTensor
 
 template <size_t N, typename T> struct Array;
+
+template <size_t N>
+using QArray = Array<N, QuantizedTensor>;
 
 template<typename T>
 struct Array<1, T> {
 
-   ~Array() { if (!mapped) free(base); }
+    ~Array() { if (!mapped) do_free(base); }
 
-    // implicit decay to pointer as a native C array
+    // implicit decay to base type (pointer when float*, as a native C array)
     operator T() const { return base; }
 
-    // return a pointer to the indexed item
+    // when float* return a pointer to the indexed item
     T operator()(size_t x = 0) { return base + x; }
 
-    void alloc(size_t n) {
+   void alloc(size_t n) {
+        size = n;
         if (!mapped) {
-            // we calloc instead of malloc to keep valgrind happy
-            base = (T)calloc(n, sizeof(float)); // FIXME std::remove_pointer<T>::type;
-            if (!base) {
+            if (!do_alloc(&base, n)) {
                 cerr << "Cannot allocate Transformer!" << endl;
                 exit(EXIT_FAILURE);
             }
         }
-        size = n;
     }
 
-    T base = NULL;
-    bool mapped = false;
-    size_t size = 0;
-};
-
-template<>
-struct Array<1, QuantizedTensor> {
-
-   ~Array() {
-        if (!mapped) {
-            free(base.q);
-            free(base.s);
-        }
-    }
-
-    // implicit decay to pointer as a native C array
-    operator QuantizedTensor() const { return base; }
-
-    // return a pointer to the indexed item
-    QuantizedTensor operator()(size_t x = 0) { return base + x; }
-
-    void alloc(size_t n) {
-        if (!mapped) {
-            // we calloc instead of malloc to keep valgrind happy
-            base.q = (int8_t*)calloc(n, sizeof(int8_t));
-            base.s = (float*)calloc(n / GS, sizeof(float)); // scaling factors are GS time less than values
-            if (!base.q || !base.s) {
-                cerr << "Cannot allocate Transformer!" << endl;
-                exit(EXIT_FAILURE);
-            }
-        }
-        size = n;
-    }
-
-    QuantizedTensor base;
+    T base = T();
     bool mapped = false;
     size_t size = 0;
 };
@@ -156,24 +143,26 @@ template<typename... Args>
 size_t argmul(Args... args) { return (size_t(1) * ... * args); }
 
 template <size_t N, typename T = float*>
-struct Array : Array<N-1,T> {
+struct Array : Array<N-1, T> {
 
     template<typename... Args>
-    T operator()(size_t x, Args... args) { return Array<N-1,T>::operator()(args...) + d * x; }
+    T operator()(size_t x, Args... args) {
+        return Array<N-1, T>::operator()(args...) + d * x;
+    }
 
     T operator()() { return this->base; }
 
     template<typename... Args>
-    void alloc(size_t a, size_t b, Args... args) { d = b * argmul(args...); Array<N-1,T>::alloc(a * b, args...); }
+    void alloc(size_t a, size_t b, Args... args) {
+        d = b * argmul(args...);
+        Array<N-1, T>::alloc(a * b, args...);
+    }
 
     size_t d;
 };
 
 // ----------------------------------------------------------------------------
 // Quantization functions
-
-template <size_t N>
-using QArray = Array<N, QuantizedTensor>;
 
 void quantize(QArray<1>& qarray, float* x) {
     QuantizedTensor qx = qarray;
