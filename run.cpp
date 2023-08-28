@@ -229,12 +229,12 @@ struct Transformer {
     int group_size;  // must be == GS
 
     // token embedding table
-    Array<2> token_embedding_table; // (vocab_size, dim)
-    QArray<2> q_token_embedding_table; // quantized version (vocab_size, dim)
+    QArray<2> q_token_embedding_table; // quantized table on disk (vocab_size, dim)
+    Array<2> token_embedding_table;    // dequantized version (vocab_size, dim)
 
     // weights for rmsnorms
-    Array<2> rms_att_weight; // (layer, dim)
-    Array<2> rms_ffn_weight; // (layer, dim)
+    Array<2> rms_att_weight;   // (layer, dim)
+    Array<2> rms_ffn_weight;   // (layer, dim)
     Array<1> rms_final_weight; // (dim,)
 
     // weights for matmuls. note dim == n_heads * head_size
@@ -249,7 +249,7 @@ struct Transformer {
     QMatrix q_w3; // (layer, hidden_dim * dim)
 
     // (optional) classifier weights for the logits, on the last layer
-    QArray<2>* q_wcls;
+    QArray<2> q_wcls, *q_wcls_ptr;
 
     // current wave of activations
     Array<1> x;         // activation at current time stamp (dim,)
@@ -270,7 +270,7 @@ struct Transformer {
     Array<4> value_cache; // (layer, seq_len, n_kv_heads, head_size)
     Array<2> freq_cis;    // (seq_len, head_size);
 
-    MMap mmap;
+    MMap mmap; // memory-maps our checkpoint file
 
     // map an Array on a MMap object
     template<size_t N, typename... Args>
@@ -281,7 +281,7 @@ struct Transformer {
     }
 
     // map a QArray on a MMap object
-   template<size_t N, typename... Args>
+    template<size_t N, typename... Args>
     void map_array(QArray<N>& a, Args... args) {
         a.base = mmap.q_next(argmul(args...));
         a.mapped = true; // prevent new memory allocation
@@ -354,8 +354,9 @@ Transformer::Transformer(const string& model_file) : mmap(model_file) {
     map_array(q_w2, n_layers, dim * hidden_dim);
     map_array(q_w3, n_layers, hidden_dim * dim);
 
-    // wcls = shared_cls ? token_embedding_table_disk : mmap.next(vocab_size * dim);
-    q_wcls = &q_token_embedding_table; // FIXME
+    // map also the classifier if not shared with token embeddings
+    q_wcls_ptr = shared_cls ? &q_token_embedding_table
+                            : (map_array(q_wcls, vocab_size, dim), &q_wcls);
 
     // allocate the run-state buffers
     x.alloc(dim);
@@ -375,7 +376,7 @@ Transformer::Transformer(const string& model_file) : mmap(model_file) {
     freq_cis.alloc(seq_len, head_size);
     token_embedding_table.alloc(vocab_size, dim);
 
-    // use full expanded version in transformer
+    // we need the expanded version
     dequantize(q_token_embedding_table, token_embedding_table);
 
     // compute freq_cis
@@ -602,7 +603,7 @@ float* Transformer::forward(int token, int pos) {
 
     // classifier into logits
     quantize(q_x, x);
-    matmul(logits, q_x, *q_wcls, dim, vocab_size);
+    matmul(logits, q_x, *q_wcls_ptr, dim, vocab_size);
     return logits;
 }
 
