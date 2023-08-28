@@ -29,7 +29,7 @@ static const int EOS = 2; // sentencepiece EOS token
 // ----------------------------------------------------------------------------
 // Base struct for int8_t grouped quantization
 
-static const int GS = 32; // group number
+static const int GS = 64; // group number
 
 struct QuantizedTensor {
     int8_t* q; // quantized values
@@ -81,6 +81,14 @@ public:
             exit(EXIT_FAILURE);
         }
         return ptr;
+    }
+
+    // for QuantizedTensor we have 2 pointers that grow by a different offset
+    QuantizedTensor q_next(size_t n) {
+        QuantizedTensor qt;
+        qt.q = next<int8_t>(n);
+        qt.s = next<float>(n / GS);
+        return qt;
     }
 };
 
@@ -208,33 +216,38 @@ void dequantize(QArray<1>& qarray, float* x) {
 // Transformer model
 
 struct Transformer {
-    int32_t dim;        // transformer dimension
-    int32_t hidden_dim; // for ffn layers
-    int32_t n_layers;   // number of layers
-    int32_t n_heads;    // number of query heads
-    int32_t n_kv_heads; // number of key/value heads (can be < query heads because of multiquery)
-    int32_t vocab_size; // vocabulary size, usually 256 (byte-level)
-    int32_t seq_len;    // max sequence length
+    int dim;         // transformer dimension
+    int hidden_dim;  // for ffn layers
+    int n_layers;    // number of layers
+    int n_heads;     // number of query heads
+    int n_kv_heads;  // number of key/value heads (can be < query heads because of multiquery)
+    int vocab_size;  // vocabulary size, usually 256 (byte-level)
+    int seq_len;     // max sequence length
+    bool shared_cls; // if true output classifier uses token_embedding_table
+    int group_size;  // must be == GS
 
     // token embedding table
-    Array<2> token_embedding_table_disk; // (vocab_size, dim) will be retired!
     Array<2> token_embedding_table; // (vocab_size, dim)
+    QArray<2> q_token_embedding_table; // quantized version (vocab_size, dim)
+
     // weights for rmsnorms
     Array<2> rms_att_weight; // (layer, dim)
     Array<2> rms_ffn_weight; // (layer, dim)
-    // weights for matmuls. note dim == n_heads * head_size
-    Array<4> wq; // (layer, dim, n_heads, head_size)
-    Array<4> wk; // (layer, dim, n_kv_heads, head_size)
-    Array<4> wv; // (layer, dim, n_kv_heads, head_size)
-    Array<4> wo; // (layer, n_heads, head_size, dim)
-    // weights for ffn
-    Array<3> w1; // (layer, hidden_dim, dim)
-    Array<3> w2; // (layer, dim, hidden_dim)
-    Array<3> w3; // (layer, hidden_dim, dim)
-    // final rmsnorm
     Array<1> rms_final_weight; // (dim,)
+
+    // weights for matmuls. note dim == n_heads * head_size
+    QArray<2> q_wq; // (layer, dim * n_heads    * head_size)
+    QArray<2> q_wk; // (layer, dim * n_kv_heads * head_size)
+    QArray<2> q_wv; // (layer, dim * n_kv_heads * head_size)
+    QArray<2> q_wo; // (layer, n_heads * head_size * dim)
+
+    // weights for ffn
+    QArray<2> q_w1; // (layer, hidden_dim * dim)
+    QArray<2> q_w2; // (layer, dim * hidden_dim)
+    QArray<2> q_w3; // (layer, hidden_dim * dim)
+
     // (optional) classifier weights for the logits, on the last layer
-    float* wcls;
+    QArray<2>* q_wcls;
 
     // current wave of activations
     Array<1> x;         // activation at current time stamp (dim,)
@@ -242,46 +255,33 @@ struct Transformer {
     Array<1> xb2;       // an additional buffer just for convenience (dim,)
     Array<1> hb;        // buffer for hidden dimension in the ffn (hidden_dim,)
     Array<1> hb2;       // buffer for hidden dimension in the ffn (hidden_dim,)
+    QArray<1> q_x;      // quantized x (dim,)
+    QArray<1> q_hb;     // quantized hb (hidden_dim,)
     Array<2> query;     // query (n_heads, head_size)
     Array<1> key;       // key (kv_dim,)
     Array<1> value;     // value (kv_dim,)
     Array<2> attention; // buffer for scores/attention values (n_heads, seq_len)
     Array<1> logits;    // output logits (vocab_size)
+
     // key and value cache
     Array<4> key_cache;   // (layer, seq_len, n_kv_heads, head_size)
     Array<4> value_cache; // (layer, seq_len, n_kv_heads, head_size)
     Array<2> freq_cis;    // (seq_len, head_size);
 
-    // --------------------------------------------------------------------------
-    // QuantizedTensors
-    //
-    // token embedding table
-    QArray<2> q_token_embedding_table; // (vocab_size, dim)
-
-    // weights for matmuls. note dim == n_heads * head_size
-    QArray<4> q_wq; // (layer, dim, n_heads, head_size)
-    QArray<4> q_wk; // (layer, dim, n_kv_heads, head_size)
-    QArray<4> q_wv; // (layer, dim, n_kv_heads, head_size)
-    QArray<4> q_wo; // (layer, n_heads, head_size, dim)
-
-    // weights for ffn
-    QArray<3> q_w1; // (layer, hidden_dim, dim)
-    QArray<3> q_w2; // (layer, dim, hidden_dim)
-    QArray<3> q_w3; // (layer, hidden_dim, dim)
-
-    // (optional) classifier weights for the logits, on the last layer
-    QArray<2>* q_wcls;
-
-    QArray<1> q_x;  // quantized x (dim,)
-    QArray<1> q_hb; // quantized hb (hidden_dim,)
-    // --------------------------------------------------------------------------
-
     MMap mmap;
 
     // map an Array on a MMap object
     template<size_t N, typename... Args>
-    void map_array(Array<N>& a, Args... args) {
+    void map_array(Array<N, float*>& a, Args... args) {
         a.base = mmap.next(argmul(args...));
+        a.mapped = true; // prevent new memory allocation
+        a.alloc(args...);
+    }
+
+    // map a QArray on a MMap object
+    template<size_t N, typename... Args>
+    void map_array(QArray<N>& a, Args... args) {
+        a.base = mmap.q_next(argmul(args...));
         a.mapped = true; // prevent new memory allocation
         a.alloc(args...);
     }
@@ -291,6 +291,19 @@ struct Transformer {
 };
 
 Transformer::Transformer(const string& model_file) : mmap(model_file) {
+    // read a version 2 quantizied .bin file
+
+    // header is used to store config parameters, before weights
+    size_t header_size = 256;
+    char* weights_ptr = mmap.next<char>(0) + header_size;
+
+    uint32_t magic  = *mmap.next<uint32_t>();
+    int32_t version = *mmap.next<int32_t>();
+
+    if (magic != 0x616b3432 || version != 2) {
+        cerr << "File format not supported!" << endl;
+        exit(EXIT_FAILURE);
+    }
 
     // read in the config header
     dim        = *mmap.next<int32_t>();
@@ -300,31 +313,39 @@ Transformer::Transformer(const string& model_file) : mmap(model_file) {
     n_kv_heads = *mmap.next<int32_t>();
     vocab_size = *mmap.next<int32_t>();
     seq_len    = *mmap.next<int32_t>();
+    shared_cls = *mmap.next<uint8_t>();
+    group_size = *mmap.next<int32_t>();
 
-    // negative vocab size is hacky way of signaling unshared weights. bit yikes.
-    bool shared_weights = (vocab_size > 0);
-    vocab_size = abs(vocab_size);
+    if (group_size != GS) {
+        cerr << "Group size: " << group_size << ", expected " << GS << endl;
+        exit(EXIT_FAILURE);
+    }
+
+    // skip padding at header tail
+    size_t padding_size = weights_ptr - mmap.next<char>(0);
+    mmap.next<char>(padding_size);
 
     // memory map the Transformer weights into the data pointer
     int head_size = dim / n_heads;
     int kv_dim = n_kv_heads * head_size;
 
-    map_array(token_embedding_table_disk, vocab_size, dim);
+    // first are the parameters that are kept in fp32
     map_array(rms_att_weight, n_layers, dim);
-    map_array(wq, n_layers, dim, n_heads, head_size);
-    map_array(wk, n_layers, dim, n_kv_heads, head_size);
-    map_array(wv, n_layers, dim, n_kv_heads, head_size);
-    map_array(wo, n_layers, n_heads, head_size, dim);
     map_array(rms_ffn_weight, n_layers, dim);
-    map_array(w1, n_layers, hidden_dim, dim);
-    map_array(w2, n_layers, dim, hidden_dim);
-    map_array(w3, n_layers, hidden_dim, dim);
     map_array(rms_final_weight, dim);
 
-    mmap.next(seq_len * head_size / 2); // skip what used to be freq_cis_real (for RoPE)
-    mmap.next(seq_len * head_size / 2); // skip what used to be freq_cis_imag (for RoPE)
+    // now read all the quantized weights
+    map_array(q_token_embedding_table, vocab_size, dim);
+    map_array(q_wq, n_layers, dim * n_heads    * head_size);
+    map_array(q_wk, n_layers, dim * n_kv_heads * head_size);
+    map_array(q_wv, n_layers, dim * n_kv_heads * head_size);
+    map_array(q_wo, n_layers, n_heads * head_size * dim);
+    map_array(q_w1, n_layers, hidden_dim * dim);
+    map_array(q_w2, n_layers, dim * hidden_dim);
+    map_array(q_w3, n_layers, hidden_dim * dim);
 
-    wcls = shared_weights ? token_embedding_table_disk : mmap.next(vocab_size * dim);
+    // wcls = shared_cls ? token_embedding_table_disk : mmap.next(vocab_size * dim);
+    q_wcls = &q_token_embedding_table; // FIXME
 
     // allocate the run-state buffers
     x.alloc(dim);
@@ -332,6 +353,8 @@ Transformer::Transformer(const string& model_file) : mmap(model_file) {
     xb2.alloc(dim);
     hb.alloc(hidden_dim);
     hb2.alloc(hidden_dim);
+    q_x.alloc(dim);
+    q_hb.alloc(hidden_dim);
     query.alloc(n_heads, head_size);
     key.alloc(kv_dim);
     value.alloc(kv_dim);
@@ -341,36 +364,6 @@ Transformer::Transformer(const string& model_file) : mmap(model_file) {
     value_cache.alloc(n_layers, seq_len, n_kv_heads, head_size);
     freq_cis.alloc(seq_len, head_size);
     token_embedding_table.alloc(vocab_size, dim);
-
-    // --------------------------------------------------------------------------
-    // QuantizedTensors
-    //
-    q_token_embedding_table.alloc(vocab_size, dim);
-    quantize(q_token_embedding_table, token_embedding_table_disk);
-
-    q_x.alloc(dim);
-    q_hb.alloc(hidden_dim);
-
-    q_wq.alloc(n_layers, dim, n_heads, head_size);
-    q_wk.alloc(n_layers, dim, n_kv_heads, head_size);
-    q_wv.alloc(n_layers, dim, n_kv_heads, head_size);
-    q_wo.alloc(n_layers, n_heads, head_size, dim);
-
-    quantize(q_wq, wq);
-    quantize(q_wk, wk);
-    quantize(q_wv, wv);
-    quantize(q_wo, wo);
-
-    q_w1.alloc(n_layers, hidden_dim, dim);
-    q_w2.alloc(n_layers, dim, hidden_dim);
-    q_w3.alloc(n_layers, hidden_dim, dim);
-
-    quantize(q_w1, w1);
-    quantize(q_w2, w2);
-    quantize(q_w3, w3);
-
-    q_wcls = &q_token_embedding_table;
-    // --------------------------------------------------------------------------
 
     // use full expanded version in transformer
     dequantize(q_token_embedding_table, token_embedding_table);
