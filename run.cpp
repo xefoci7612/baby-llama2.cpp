@@ -120,6 +120,8 @@ template <size_t N, typename T> struct Array;
 template <size_t N>
 using QArray = Array<N, QuantizedTensor>;
 
+typedef vector<QArray<1>> QMatrix;
+
 template<typename T>
 struct Array<1, T> {
 
@@ -236,15 +238,15 @@ struct Transformer {
     Array<1> rms_final_weight; // (dim,)
 
     // weights for matmuls. note dim == n_heads * head_size
-    QArray<2> q_wq; // (layer, dim * n_heads    * head_size)
-    QArray<2> q_wk; // (layer, dim * n_kv_heads * head_size)
-    QArray<2> q_wv; // (layer, dim * n_kv_heads * head_size)
-    QArray<2> q_wo; // (layer, n_heads * head_size * dim)
+    QMatrix q_wq; // (layer, dim * n_heads    * head_size)
+    QMatrix q_wk; // (layer, dim * n_kv_heads * head_size)
+    QMatrix q_wv; // (layer, dim * n_kv_heads * head_size)
+    QMatrix q_wo; // (layer, n_heads * head_size * dim)
 
     // weights for ffn
-    QArray<2> q_w1; // (layer, hidden_dim * dim)
-    QArray<2> q_w2; // (layer, dim * hidden_dim)
-    QArray<2> q_w3; // (layer, hidden_dim * dim)
+    QMatrix q_w1; // (layer, hidden_dim * dim)
+    QMatrix q_w2; // (layer, dim * hidden_dim)
+    QMatrix q_w3; // (layer, hidden_dim * dim)
 
     // (optional) classifier weights for the logits, on the last layer
     QArray<2>* q_wcls;
@@ -279,11 +281,19 @@ struct Transformer {
     }
 
     // map a QArray on a MMap object
-    template<size_t N, typename... Args>
+   template<size_t N, typename... Args>
     void map_array(QArray<N>& a, Args... args) {
         a.base = mmap.q_next(argmul(args...));
         a.mapped = true; // prevent new memory allocation
         a.alloc(args...);
+    }
+
+    // in case of a QMatrix, QuantizedTensors are serialized
+    // per layer, so we allocate a vector of QArray
+    void map_array(QMatrix& a, size_t l, size_t dim) {
+        a.resize(l);
+        for (size_t i = 0; i < l; i++)
+            map_array(a[i], dim);
     }
 
     Transformer(const string& model_file);
@@ -489,9 +499,9 @@ float* Transformer::forward(int token, int pos) {
 
         // qkv matmuls for this position (V X M = V)
         quantize(q_x, xb);
-        matmul(query, q_x, q_wq(l), dim, dim);
-        matmul(key, q_x, q_wk(l), dim, kv_dim);
-        matmul(value, q_x, q_wv(l), dim, kv_dim);
+        matmul(query, q_x, q_wq[l], dim, dim);
+        matmul(key, q_x, q_wk[l], dim, kv_dim);
+        matmul(value, q_x, q_wv[l], dim, kv_dim);
 
         // RoPE relative positional encoding: complex-valued
         // rotate query and key by freq in each head
@@ -551,7 +561,7 @@ float* Transformer::forward(int token, int pos) {
 
         // final matmul to get the output of the attention
         quantize(q_x, xb);
-        matmul(xb2, q_x, q_wo(l), dim, dim);
+        matmul(xb2, q_x, q_wo[l], dim, dim);
 
         // residual connection back into x
         for (int i = 0; i < dim; i++) {
@@ -564,8 +574,8 @@ float* Transformer::forward(int token, int pos) {
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
         quantize(q_x, xb);
-        matmul(hb, q_x, q_w1(l), dim, hidden_dim);
-        matmul(hb2, q_x, q_w3(l), dim, hidden_dim);
+        matmul(hb, q_x, q_w1[l], dim, hidden_dim);
+        matmul(hb2, q_x, q_w3[l], dim, hidden_dim);
 
         // SwiGLU non-linearity
         for (int i = 0; i < hidden_dim; i++) {
@@ -579,7 +589,7 @@ float* Transformer::forward(int token, int pos) {
 
         // final matmul to get the output of the ffn
         quantize(q_hb, hb);
-        matmul(xb, q_hb, q_w2(l), hidden_dim, dim);
+        matmul(xb, q_hb, q_w2[l], hidden_dim, dim);
 
         // residual connection
         for (int i = 0; i < dim; i++) {
