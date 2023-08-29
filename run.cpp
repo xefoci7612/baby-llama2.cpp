@@ -108,66 +108,64 @@ struct Memory {
 
 // ----------------------------------------------------------------------------
 // A simple dynamic multi-dimensional array M(x,y) -> &M[x][y], M(x) -> M[x][...]
-// used for both float* and quantized tensors
+// used for both floats and quantized tensors
 
-template <size_t N, typename T> struct TArray;
+template <typename T> struct TArray;
 
-// Array is for standard n-dimensional arrays of float weights
-template <size_t N>
-using Array = TArray<N, float*>;
+// Array is for standard n-dimensional array of float weights
+typedef TArray<float*> Array;
 
-// QArray is for quantized tensors
-template <size_t N>
-using QArray = TArray<N, QuantizedTensor>;
+// QArray is for quantized tensor
+typedef TArray<QuantizedTensor> QArray;
 
-// QMatrix is for matrix of quantized tensors grouped per layer
-template <size_t N>
-using QMatrix = vector<QArray<N-1>>;
+// QMatrix is for matrix of quantized tensors, grouped per layer
+typedef vector<QArray> QMatrix;
 
 // Little helper to multiply args with a fold expressions
 template<typename... Args>
 size_t argmul(Args... args) { return (size_t(1) * ... * args); }
 
-template<typename T>
-struct TArray<1, T> {
+template <typename T>
+struct TArray {
 
-    // implicit decay to base type (float*, as a native C array)
+    // implicit decay to base pointer (float*) as a native C array
     operator T() const { return base; }
 
-    // when float* return a pointer to the indexed item
-    T operator()(size_t x = 0) { return base + x; }
+    // compute address given indices
+    template<size_t I> size_t addr() const { return 0; }
 
-   void set_shape(size_t n) { size = n; }
+    template<size_t I, typename... Args>
+    size_t addr(size_t x, Args... args) const {
+        return x * d[I] + addr<I+1>(args...);
+    }
+
+    // return a pointer to the indexed item
+    template<typename... Args>
+    T operator()(Args... args) const {
+        return base + addr<1>(args...);
+    }
+
+    // set array dimensions and shape
+    template<size_t I> void set_shape() { d[I] = 1; }
+
+    template<size_t I, typename... Args>
+    void set_shape(size_t a, Args... args) {
+        d[I] = a * argmul(args...);
+        set_shape<I+1>(args...);
+    }
+
+    size_t size() const { return d[0]; }
 
     T base = T();
-    size_t size = 0;
-};
-
-template <size_t N, typename T>
-struct TArray : TArray<N-1, T> {
-
-    template<typename... Args>
-    T operator()(size_t x, Args... args) {
-        return TArray<N-1, T>::operator()(args...) + d * x;
-    }
-
-    T operator()() { return this->base; }
-
-    template<typename... Args>
-    void set_shape(size_t a, size_t b, Args... args) {
-        d = b * argmul(args...);
-        TArray<N-1, T>::set_shape(a * b, args...);
-    }
-
-    size_t d;
+    size_t d[8] = {};
 };
 
 // ----------------------------------------------------------------------------
 // Quantization functions
 
-void quantize(QArray<1>& qarray, float* x) {
+void quantize(QArray& qarray, float* x) {
     QuantizedTensor qx = qarray;
-    int n = qarray.size;
+    int n = qarray.size();
     int num_groups = n / GS;
     float Q_MAX = 127.0f;
 
@@ -197,9 +195,9 @@ void quantize(QArray<1>& qarray, float* x) {
     }
 }
 
-void dequantize(QArray<1>& qarray, float* x) {
+void dequantize(QArray& qarray, float* x) {
     QuantizedTensor qx = qarray;
-    int n = qarray.size;
+    int n = qarray.size();
     for (int i = 0; i < n; i++) {
         x[i] = qx.q[i] * qx.s[i / GS];
     }
@@ -220,87 +218,88 @@ struct Transformer {
     int group_size;  // must be == GS
 
     // token embedding table
-    QArray<2> q_token_embedding_table; // quantized table on disk (vocab_size, dim)
-    Array<2> token_embedding_table;    // dequantized version (vocab_size, dim)
+    QArray q_token_embedding_table; // quantized table on disk (vocab_size, dim)
+    Array token_embedding_table;    // dequantized version (vocab_size, dim)
 
     // weights for rmsnorms
-    Array<2> rms_att_weight;   // (layer, dim)
-    Array<2> rms_ffn_weight;   // (layer, dim)
-    Array<1> rms_final_weight; // (dim,)
+    Array rms_att_weight;   // (layer, dim)
+    Array rms_ffn_weight;   // (layer, dim)
+    Array rms_final_weight; // (dim,)
 
     // weights for matmuls. note dim == n_heads * head_size
-    QMatrix<2> q_wq; // (layer, dim * n_heads * head_size)
-    QMatrix<2> q_wk; // (layer, dim * n_kv_heads * head_size)
-    QMatrix<2> q_wv; // (layer, dim * n_kv_heads * head_size)
-    QMatrix<2> q_wo; // (layer, n_heads * head_size * dim)
+    QMatrix q_wq; // (layer, dim, n_heads, head_size)
+    QMatrix q_wk; // (layer, dim, n_kv_heads, head_size)
+    QMatrix q_wv; // (layer, dim, n_kv_heads, head_size)
+    QMatrix q_wo; // (layer, n_heads, head_size, dim)
 
     // weights for ffn
-    QMatrix<2> q_w1; // (layer, hidden_dim * dim)
-    QMatrix<2> q_w2; // (layer, dim * hidden_dim)
-    QMatrix<2> q_w3; // (layer, hidden_dim * dim)
+    QMatrix q_w1; // (layer, hidden_dim, dim)
+    QMatrix q_w2; // (layer, dim, hidden_dim)
+    QMatrix q_w3; // (layer, hidden_dim, dim)
 
     // (optional) classifier weights for the logits, on the last layer
-    QArray<2> q_wcls, *q_wcls_ptr;
+    QArray q_wcls, *q_wcls_ptr;
 
     // current wave of activations
-    Array<1> x;         // activation at current time stamp (dim,)
-    Array<2> xb;        // same, but inside a residual branch (dim,)
-    Array<1> xb2;       // an additional buffer just for convenience (dim,)
-    Array<1> hb;        // buffer for hidden dimension in the ffn (hidden_dim,)
-    Array<1> hb2;       // buffer for hidden dimension in the ffn (hidden_dim,)
-    QArray<1> q_x;      // quantized x (dim,)
-    QArray<1> q_hb;     // quantized hb (hidden_dim,)
-    Array<2> query;     // query (n_heads, head_size)
-    Array<1> key;       // key (kv_dim,)
-    Array<1> value;     // value (kv_dim,)
-    Array<2> attention; // buffer for scores/attention values (n_heads, seq_len)
-    Array<1> logits;    // output logits (vocab_size)
+    Array x;         // activation at current time stamp (dim,)
+    Array xb;        // same, but inside a residual branch (dim,)
+    Array xb2;       // an additional buffer just for convenience (dim,)
+    Array hb;        // buffer for hidden dimension in the ffn (hidden_dim,)
+    Array hb2;       // buffer for hidden dimension in the ffn (hidden_dim,)
+    QArray q_x;      // quantized x (dim,)
+    QArray q_hb;     // quantized hb (hidden_dim,)
+    Array query;     // query (n_heads, head_size)
+    Array key;       // key (kv_dim,)
+    Array value;     // value (kv_dim,)
+    Array attention; // buffer for scores/attention values (n_heads, seq_len)
+    Array logits;    // output logits (vocab_size)
 
     // key and value cache
-    Array<4> key_cache;   // (layer, seq_len, n_kv_heads, head_size)
-    Array<4> value_cache; // (layer, seq_len, n_kv_heads, head_size)
-    Array<2> freq_cis;    // (seq_len, head_size);
+    Array key_cache;   // (layer, seq_len, n_kv_heads, head_size)
+    Array value_cache; // (layer, seq_len, n_kv_heads, head_size)
+    Array freq_cis;    // (seq_len, head_size);
 
     MMap mmap;  // memory map object of the checkpoint file
     Memory mem; // memory allocation object
 
     // allocate memory for an Array
-    template<size_t N, typename... Args>
-    void alloc(Array<N>& a, Args... args) {
+    template<typename... Args>
+    void alloc(Array& a, Args... args) {
         a.base = mem.alloc<float>(argmul(args...));
-        a.set_shape(args...);
+        a.set_shape<0>(args...);
     }
 
     // map an Array
-    template<size_t N, typename... Args>
-    void map(Array<N>& a, Args... args) {
+    template<typename... Args>
+    void map(Array& a, Args... args) {
         a.base = mmap.next(argmul(args...));
-        a.set_shape(args...);
+        a.set_shape<0>(args...);
     }
 
     // allocate memory for a QArray
-    template<size_t N, typename... Args>
-    void alloc(QArray<N>& a, Args... args) {
+    template<typename... Args>
+    void alloc(QArray& a, Args... args) {
         // scaling factors are GS time less than values
         a.base.q = mem.alloc<int8_t>(argmul(args...));
         a.base.s = mem.alloc<float>(argmul(args...) / GS);
-        a.set_shape(args...);
+        a.set_shape<0>(args...);
     }
 
     // map a QArray
-    template<size_t N, typename... Args>
-    void map(QArray<N>& a, Args... args) {
+    template<typename... Args>
+    void map(QArray& a, Args... args) {
         a.base.q = mmap.next<int8_t>(argmul(args...));
         a.base.s = mmap.next<float>(argmul(args...) / GS);
-        a.set_shape(args...);
+        a.set_shape<0>(args...);
     }
 
     // in case of a QMatrix, QuantizedTensors are serialized
     // per layer, so we allocate a vector of QArray
-    void map(QMatrix<2>& a, size_t l, size_t dim) {
+    template<typename... Args>
+    void map(QMatrix& a, size_t l, Args... args) {
         a.resize(l);
         for (size_t i = 0; i < l; i++)
-            map(a[i], dim); //full shape
+            map(a[i], args...);
     }
 
     Transformer(const string& model_file);
@@ -353,13 +352,13 @@ Transformer::Transformer(const string& model_file) : mmap(model_file) {
 
     // now read all the quantized weights
     map(q_token_embedding_table, vocab_size, dim);
-    map(q_wq, n_layers, dim * n_heads * head_size);
-    map(q_wk, n_layers, dim * n_kv_heads * head_size);
-    map(q_wv, n_layers, dim * n_kv_heads * head_size);
-    map(q_wo, n_layers, n_heads * head_size * dim);
-    map(q_w1, n_layers, hidden_dim * dim);
-    map(q_w2, n_layers, dim * hidden_dim);
-    map(q_w3, n_layers, hidden_dim * dim);
+    map(q_wq, n_layers, dim, n_heads, head_size);
+    map(q_wk, n_layers, dim, n_kv_heads, head_size);
+    map(q_wv, n_layers, dim, n_kv_heads, head_size);
+    map(q_wo, n_layers, n_heads, head_size, dim);
+    map(q_w1, n_layers, hidden_dim, dim);
+    map(q_w2, n_layers, dim, hidden_dim);
+    map(q_w3, n_layers, hidden_dim, dim);
 
     // map also the classifier if not shared with token embeddings
     q_wcls_ptr = shared_cls ? &q_token_embedding_table
@@ -456,8 +455,6 @@ void matmul(float* xout, const QuantizedTensor& x, const QuantizedTensor& w, int
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
     // inputs to this function are both quantized
-
-	// TODO compute int n, int d out of x,w
 
     int i;
     #pragma omp parallel for private(i)
