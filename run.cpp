@@ -36,6 +36,7 @@ struct QuantizedTensor {
     float* s;  // scaling factors, they are GS times less than values
 };
 
+// allow pointer arithmetic on QuantizedTensors
 QuantizedTensor operator+(const QuantizedTensor& qt, size_t n) {
     return QuantizedTensor{ qt.q + n, qt.s + (n / GS) };
 }
@@ -82,90 +83,80 @@ public:
         }
         return ptr;
     }
-
-    // for QuantizedTensor we have 2 pointers that grow by a different offset
-    QuantizedTensor q_next(size_t n) {
-        QuantizedTensor qt;
-        qt.q = next<int8_t>(n);
-        qt.s = next<float>(n / GS);
-        return qt;
-    }
 };
 
 // ----------------------------------------------------------------------------
-// Low level memory allocation/release functions
+// Memory management to alloc/release stuff for us
 
-bool do_alloc(float** base, size_t n) {
-    // we calloc instead of malloc to keep valgrind happy
-    *base = (float*)calloc(n, sizeof(float));
-    return *base != NULL;
-}
+struct Memory {
+    ~Memory() { for(void* p : m) free(p); }
 
-bool do_alloc(QuantizedTensor* base, size_t n) {
-    // scaling factors are GS time less than values
-    base->q = (int8_t*)calloc(n, sizeof(int8_t));
-    base->s = (float*)calloc(n / GS, sizeof(float));
-    return base->q != NULL && base->s != NULL;
-}
+    template<typename T>
+    T* alloc(size_t n) {
+        // we calloc instead of malloc to keep valgrind happy
+        void* p = calloc(n, sizeof(T));
+        if (!p) {
+            cerr << "Cannot allocate memory!" << endl;
+            exit(EXIT_FAILURE);
+        }
+        m.push_back(p);
+        return static_cast<T*>(p);
+    }
 
-void do_free(float* base) { free(base); }
-void do_free(QuantizedTensor& base) { free(base.q); free(base.s); }
+    vector<void*> m;
+};
 
 // ----------------------------------------------------------------------------
 // A simple dynamic multi-dimensional array M(x,y) -> &M[x][y], M(x) -> M[x][...]
-// used for both float* and QuantizedTensor
+// used for both float* and quantized tensors
 
-template <size_t N, typename T> struct Array;
+template <size_t N, typename T> struct TArray;
 
+// Array is for standard n-dimensional arrays of float weights
 template <size_t N>
-using QArray = Array<N, QuantizedTensor>;
+using Array = TArray<N, float*>;
 
-typedef vector<QArray<1>> QMatrix;
+// QArray is for quantized tensors
+template <size_t N>
+using QArray = TArray<N, QuantizedTensor>;
+
+// QMatrix is for matrix of quantized tensors grouped per layer
+template <size_t N>
+using QMatrix = vector<QArray<N-1>>;
+
+// Little helper to multiply args with a fold expressions
+template<typename... Args>
+size_t argmul(Args... args) { return (size_t(1) * ... * args); }
 
 template<typename T>
-struct Array<1, T> {
+struct TArray<1, T> {
 
-    ~Array() { if (!mapped) do_free(base); }
-
-    // implicit decay to base type (pointer when float*, as a native C array)
+    // implicit decay to base type (float*, as a native C array)
     operator T() const { return base; }
 
     // when float* return a pointer to the indexed item
     T operator()(size_t x = 0) { return base + x; }
 
-   void alloc(size_t n) {
-        size = n;
-        if (!mapped) {
-            if (!do_alloc(&base, n)) {
-                cerr << "Cannot allocate Transformer!" << endl;
-                exit(EXIT_FAILURE);
-            }
-        }
-    }
+   void set_shape(size_t n) { size = n; }
 
     T base = T();
-    bool mapped = false;
     size_t size = 0;
 };
 
-// Helper to multiply args with a fold expressions
-template<typename... Args>
-size_t argmul(Args... args) { return (size_t(1) * ... * args); }
-
-template <size_t N, typename T = float*>
-struct Array : Array<N-1, T> {
+template <size_t N, typename T>
+struct TArray : TArray<N-1, T> {
 
     template<typename... Args>
     T operator()(size_t x, Args... args) {
-        return Array<N-1, T>::operator()(args...) + d * x;
+        return TArray<N-1, T>::operator()(args...) + d * x;
     }
 
     T operator()() { return this->base; }
 
     template<typename... Args>
-    void alloc(size_t a, size_t b, Args... args) {
+    void set_shape(size_t a, size_t b, Args... args) {
         d = b * argmul(args...);
-        Array<N-1, T>::alloc(a * b, args...);
+        TArray<N-1, T>::set_shape(a * b, args...);
     }
 
     size_t d;
@@ -197,9 +188,9 @@ void quantize(QArray<1>& qarray, float* x) {
         float scale = wmax / Q_MAX;
         qx.s[group] = scale;
 
-        // // calculate and write the quantized values
+        // calculate and write the quantized values
         for (int i = 0; i < GS; i++) {
-            float quant_value = x[group * GS + i] / scale; // scale
+            float quant_value = x[group * GS + i] / scale;  // scale
             int8_t quantized = (int8_t) round(quant_value); // round and clamp
             qx.q[group * GS + i] = quantized;
         }
@@ -238,15 +229,15 @@ struct Transformer {
     Array<1> rms_final_weight; // (dim,)
 
     // weights for matmuls. note dim == n_heads * head_size
-    QMatrix q_wq; // (layer, dim * n_heads    * head_size)
-    QMatrix q_wk; // (layer, dim * n_kv_heads * head_size)
-    QMatrix q_wv; // (layer, dim * n_kv_heads * head_size)
-    QMatrix q_wo; // (layer, n_heads * head_size * dim)
+    QMatrix<2> q_wq; // (layer, dim * n_heads * head_size)
+    QMatrix<2> q_wk; // (layer, dim * n_kv_heads * head_size)
+    QMatrix<2> q_wv; // (layer, dim * n_kv_heads * head_size)
+    QMatrix<2> q_wo; // (layer, n_heads * head_size * dim)
 
     // weights for ffn
-    QMatrix q_w1; // (layer, hidden_dim * dim)
-    QMatrix q_w2; // (layer, dim * hidden_dim)
-    QMatrix q_w3; // (layer, hidden_dim * dim)
+    QMatrix<2> q_w1; // (layer, hidden_dim * dim)
+    QMatrix<2> q_w2; // (layer, dim * hidden_dim)
+    QMatrix<2> q_w3; // (layer, hidden_dim * dim)
 
     // (optional) classifier weights for the logits, on the last layer
     QArray<2> q_wcls, *q_wcls_ptr;
@@ -270,30 +261,46 @@ struct Transformer {
     Array<4> value_cache; // (layer, seq_len, n_kv_heads, head_size)
     Array<2> freq_cis;    // (seq_len, head_size);
 
-    MMap mmap; // memory-maps our checkpoint file
+    MMap mmap;  // memory map object of the checkpoint file
+    Memory mem; // memory allocation object
 
-    // map an Array on a MMap object
+    // allocate memory for an Array
     template<size_t N, typename... Args>
-    void map_array(Array<N, float*>& a, Args... args) {
-        a.base = mmap.next(argmul(args...));
-        a.mapped = true; // prevent new memory allocation
-        a.alloc(args...);
+    void alloc(Array<N>& a, Args... args) {
+        a.base = mem.alloc<float>(argmul(args...));
+        a.set_shape(args...);
     }
 
-    // map a QArray on a MMap object
+    // map an Array
     template<size_t N, typename... Args>
-    void map_array(QArray<N>& a, Args... args) {
-        a.base = mmap.q_next(argmul(args...));
-        a.mapped = true; // prevent new memory allocation
-        a.alloc(args...);
+    void map(Array<N>& a, Args... args) {
+        a.base = mmap.next(argmul(args...));
+        a.set_shape(args...);
+    }
+
+    // allocate memory for a QArray
+    template<size_t N, typename... Args>
+    void alloc(QArray<N>& a, Args... args) {
+        // scaling factors are GS time less than values
+        a.base.q = mem.alloc<int8_t>(argmul(args...));
+        a.base.s = mem.alloc<float>(argmul(args...) / GS);
+        a.set_shape(args...);
+    }
+
+    // map a QArray
+    template<size_t N, typename... Args>
+    void map(QArray<N>& a, Args... args) {
+        a.base.q = mmap.next<int8_t>(argmul(args...));
+        a.base.s = mmap.next<float>(argmul(args...) / GS);
+        a.set_shape(args...);
     }
 
     // in case of a QMatrix, QuantizedTensors are serialized
     // per layer, so we allocate a vector of QArray
-    void map_array(QMatrix& a, size_t l, size_t dim) {
+    void map(QMatrix<2>& a, size_t l, size_t dim) {
         a.resize(l);
         for (size_t i = 0; i < l; i++)
-            map_array(a[i], dim);
+            map(a[i], dim); //full shape
     }
 
     Transformer(const string& model_file);
@@ -340,41 +347,41 @@ Transformer::Transformer(const string& model_file) : mmap(model_file) {
     int kv_dim = n_kv_heads * head_size;
 
     // first are the parameters that are kept in fp32
-    map_array(rms_att_weight, n_layers, dim);
-    map_array(rms_ffn_weight, n_layers, dim);
-    map_array(rms_final_weight, dim);
+    map(rms_att_weight, n_layers, dim);
+    map(rms_ffn_weight, n_layers, dim);
+    map(rms_final_weight, dim);
 
     // now read all the quantized weights
-    map_array(q_token_embedding_table, vocab_size, dim);
-    map_array(q_wq, n_layers, dim * n_heads    * head_size);
-    map_array(q_wk, n_layers, dim * n_kv_heads * head_size);
-    map_array(q_wv, n_layers, dim * n_kv_heads * head_size);
-    map_array(q_wo, n_layers, n_heads * head_size * dim);
-    map_array(q_w1, n_layers, hidden_dim * dim);
-    map_array(q_w2, n_layers, dim * hidden_dim);
-    map_array(q_w3, n_layers, hidden_dim * dim);
+    map(q_token_embedding_table, vocab_size, dim);
+    map(q_wq, n_layers, dim * n_heads * head_size);
+    map(q_wk, n_layers, dim * n_kv_heads * head_size);
+    map(q_wv, n_layers, dim * n_kv_heads * head_size);
+    map(q_wo, n_layers, n_heads * head_size * dim);
+    map(q_w1, n_layers, hidden_dim * dim);
+    map(q_w2, n_layers, dim * hidden_dim);
+    map(q_w3, n_layers, hidden_dim * dim);
 
     // map also the classifier if not shared with token embeddings
     q_wcls_ptr = shared_cls ? &q_token_embedding_table
-                            : (map_array(q_wcls, vocab_size, dim), &q_wcls);
+                            : (map(q_wcls, vocab_size, dim), &q_wcls);
 
     // allocate the run-state buffers
-    x.alloc(dim);
-    xb.alloc(n_heads, head_size); // dim == n_heads * head_size
-    xb2.alloc(dim);
-    hb.alloc(hidden_dim);
-    hb2.alloc(hidden_dim);
-    q_x.alloc(dim);
-    q_hb.alloc(hidden_dim);
-    query.alloc(n_heads, head_size);
-    key.alloc(kv_dim);
-    value.alloc(kv_dim);
-    attention.alloc(n_heads, seq_len);
-    logits.alloc(vocab_size);
-    key_cache.alloc(n_layers, seq_len, n_kv_heads, head_size);
-    value_cache.alloc(n_layers, seq_len, n_kv_heads, head_size);
-    freq_cis.alloc(seq_len, head_size);
-    token_embedding_table.alloc(vocab_size, dim);
+    alloc(x, dim);
+    alloc(xb, n_heads, head_size); // dim == n_heads * head_size
+    alloc(xb2, dim);
+    alloc(hb, hidden_dim);
+    alloc(hb2, hidden_dim);
+    alloc(q_x, dim);
+    alloc(q_hb, hidden_dim);
+    alloc(query, n_heads, head_size);
+    alloc(key, kv_dim);
+    alloc(value, kv_dim);
+    alloc(attention, n_heads, seq_len);
+    alloc(logits, vocab_size);
+    alloc(key_cache, n_layers, seq_len, n_kv_heads, head_size);
+    alloc(value_cache, n_layers, seq_len, n_kv_heads, head_size);
+    alloc(freq_cis, seq_len, head_size);
+    alloc(token_embedding_table, vocab_size, dim);
 
     // we need the expanded version
     dequantize(q_token_embedding_table, token_embedding_table);
@@ -449,6 +456,8 @@ void matmul(float* xout, const QuantizedTensor& x, const QuantizedTensor& w, int
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
     // inputs to this function are both quantized
+
+	// TODO compute int n, int d out of x,w
 
     int i;
     #pragma omp parallel for private(i)
