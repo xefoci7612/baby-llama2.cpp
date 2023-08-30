@@ -36,7 +36,7 @@ struct QuantizedTensor {
     float* s;  // scaling factors, they are GS times less than values
 };
 
-// allow pointer arithmetic on QuantizedTensors
+// pointer arithmetic on QuantizedTensor
 QuantizedTensor operator+(const QuantizedTensor& qt, size_t n) {
     return QuantizedTensor{ qt.q + n, qt.s + (n / GS) };
 }
@@ -72,8 +72,8 @@ public:
     }
    ~MMap() { munmap(data, size); }
 
-    // return a pointer to current position and update the read pointer
-    template<typename T = float>
+    // return a pointer to current position and update read pointer
+    template<typename T>
     T* next(size_t n = 1) {
         T* ptr = reinterpret_cast<T*>(cur);
         cur += n * sizeof(T);
@@ -86,7 +86,7 @@ public:
 };
 
 // ----------------------------------------------------------------------------
-// Memory management to alloc/release stuff for us
+// Memory management to alloc/release stuff
 
 struct Memory {
     ~Memory() { for(void* p : m) free(p); }
@@ -173,13 +173,15 @@ void quantize(QArray& qarray, float* x) {
     #pragma omp parallel for private(group)
     for (group = 0; group < num_groups; group++) {
 
+        float* g_start = x + group * GS;
+        float* g_end = g_start + GS;
+
         // find the max absolute value in the current group
         float wmax = 0.0;
-        for (int i = 0; i < GS; i++) {
-            float val = fabs(x[group * GS + i]);
-            if (val > wmax) {
+        for (float* p = g_start; p < g_end; p++) {
+            float val = fabs(*p);
+            if (val > wmax)
                 wmax = val;
-            }
         }
 
         // calculate and write the scaling factor
@@ -187,20 +189,17 @@ void quantize(QArray& qarray, float* x) {
         qx.s[group] = scale;
 
         // calculate and write the quantized values
-        for (int i = 0; i < GS; i++) {
-            float quant_value = x[group * GS + i] / scale;  // scale
-            int8_t quantized = (int8_t) round(quant_value); // round and clamp
-            qx.q[group * GS + i] = quantized;
-        }
+        int8_t* q = qx.q + group * GS;
+        for (float* p = g_start; p < g_end; p++)
+            *q++ = (int8_t) round(*p / scale); // scale, round and clamp
     }
 }
 
 void dequantize(QArray& qarray, float* x) {
     QuantizedTensor qx = qarray;
     int n = qarray.size();
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n; i++)
         x[i] = qx.q[i] * qx.s[i / GS];
-    }
 }
 
 // ----------------------------------------------------------------------------
@@ -262,44 +261,35 @@ struct Transformer {
     MMap mmap;  // memory map object of the checkpoint file
     Memory mem; // memory allocation object
 
-    // allocate memory for an Array
-    template<typename... Args>
-    void alloc(Array& a, Args... args) {
-        a.base = mem.alloc<float>(argmul(args...));
+    enum { Alloc = true, Map = false };
+
+    // allocate or map
+    template<bool A, typename T>
+    T* set(size_t n) { return A ? mem.alloc<T>(n) : mmap.next<T>(n); }
+
+    // allocate or map an Array
+    template<bool A, typename... Args>
+    void set(Array& a, Args... args) {
+        a.base = set<A, float>(argmul(args...));
         a.set_shape<0>(args...);
     }
 
-    // map an Array
-    template<typename... Args>
-    void map(Array& a, Args... args) {
-        a.base = mmap.next(argmul(args...));
-        a.set_shape<0>(args...);
-    }
-
-    // allocate memory for a QArray
-    template<typename... Args>
-    void alloc(QArray& a, Args... args) {
+    // allocate or map a QArray
+    template<bool A, typename... Args>
+    void set(QArray& a, Args... args) {
         // scaling factors are GS time less than values
-        a.base.q = mem.alloc<int8_t>(argmul(args...));
-        a.base.s = mem.alloc<float>(argmul(args...) / GS);
-        a.set_shape<0>(args...);
-    }
-
-    // map a QArray
-    template<typename... Args>
-    void map(QArray& a, Args... args) {
-        a.base.q = mmap.next<int8_t>(argmul(args...));
-        a.base.s = mmap.next<float>(argmul(args...) / GS);
+        a.base.q = set<A, int8_t>(argmul(args...));
+        a.base.s = set<A, float>(argmul(args...) / GS);
         a.set_shape<0>(args...);
     }
 
     // in case of a QMatrix, QuantizedTensors are serialized
     // per layer, so we allocate a vector of QArray
-    template<typename... Args>
-    void map(QMatrix& a, size_t l, Args... args) {
+    template<bool A, typename... Args>
+    void set(QMatrix& a, size_t l, Args... args) {
         a.resize(l);
         for (size_t i = 0; i < l; i++)
-            map(a[i], args...);
+            set<A>(a[i], args...);
     }
 
     Transformer(const string& model_file);
@@ -346,43 +336,43 @@ Transformer::Transformer(const string& model_file) : mmap(model_file) {
     int kv_dim = n_kv_heads * head_size;
 
     // first are the parameters that are kept in fp32
-    map(rms_att_weight, n_layers, dim);
-    map(rms_ffn_weight, n_layers, dim);
-    map(rms_final_weight, dim);
+    set<Map>(rms_att_weight, n_layers, dim);
+    set<Map>(rms_ffn_weight, n_layers, dim);
+    set<Map>(rms_final_weight, dim);
 
     // now read all the quantized weights
-    map(q_token_embedding_table, vocab_size, dim);
-    map(q_wq, n_layers, dim, n_heads, head_size);
-    map(q_wk, n_layers, dim, n_kv_heads, head_size);
-    map(q_wv, n_layers, dim, n_kv_heads, head_size);
-    map(q_wo, n_layers, n_heads, head_size, dim);
-    map(q_w1, n_layers, hidden_dim, dim);
-    map(q_w2, n_layers, dim, hidden_dim);
-    map(q_w3, n_layers, hidden_dim, dim);
+    set<Map>(q_token_embedding_table, vocab_size, dim);
+    set<Map>(q_wq, n_layers, dim, n_heads, head_size);
+    set<Map>(q_wk, n_layers, dim, n_kv_heads, head_size);
+    set<Map>(q_wv, n_layers, dim, n_kv_heads, head_size);
+    set<Map>(q_wo, n_layers, n_heads, head_size, dim);
+    set<Map>(q_w1, n_layers, hidden_dim, dim);
+    set<Map>(q_w2, n_layers, dim, hidden_dim);
+    set<Map>(q_w3, n_layers, hidden_dim, dim);
 
     // map also the classifier if not shared with token embeddings
     q_wcls_ptr = shared_cls ? &q_token_embedding_table
-                            : (map(q_wcls, vocab_size, dim), &q_wcls);
+                            : (set<Map>(q_wcls, vocab_size, dim), &q_wcls);
 
     // allocate the run-state buffers
-    alloc(x, dim);
-    alloc(xb, n_heads, head_size); // dim == n_heads * head_size
-    alloc(xb2, dim);
-    alloc(hb, hidden_dim);
-    alloc(hb2, hidden_dim);
-    alloc(q_x, dim);
-    alloc(q_hb, hidden_dim);
-    alloc(query, n_heads, head_size);
-    alloc(key, kv_dim);
-    alloc(value, kv_dim);
-    alloc(attention, n_heads, seq_len);
-    alloc(logits, vocab_size);
-    alloc(key_cache, n_layers, seq_len, n_kv_heads, head_size);
-    alloc(value_cache, n_layers, seq_len, n_kv_heads, head_size);
-    alloc(freq_cis, seq_len, head_size);
-    alloc(token_embedding_table, vocab_size, dim);
+    set<Alloc>(x, dim);
+    set<Alloc>(xb, n_heads, head_size); // dim == n_heads * head_size
+    set<Alloc>(xb2, dim);
+    set<Alloc>(hb, hidden_dim);
+    set<Alloc>(hb2, hidden_dim);
+    set<Alloc>(q_x, dim);
+    set<Alloc>(q_hb, hidden_dim);
+    set<Alloc>(query, n_heads, head_size);
+    set<Alloc>(key, kv_dim);
+    set<Alloc>(value, kv_dim);
+    set<Alloc>(attention, n_heads, seq_len);
+    set<Alloc>(logits, vocab_size);
+    set<Alloc>(key_cache, n_layers, seq_len, n_kv_heads, head_size);
+    set<Alloc>(value_cache, n_layers, seq_len, n_kv_heads, head_size);
+    set<Alloc>(freq_cis, seq_len, head_size);
+    set<Alloc>(token_embedding_table, vocab_size, dim);
 
-    // we need the expanded version
+    // we need also the expanded version
     dequantize(q_token_embedding_table, token_embedding_table);
 
     // compute freq_cis
