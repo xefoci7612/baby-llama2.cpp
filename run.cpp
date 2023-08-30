@@ -286,10 +286,10 @@ struct Transformer {
     // in case of a QMatrix, QuantizedTensors are serialized
     // per layer, so we allocate a vector of QArray
     template<bool A, typename... Args>
-    void set(QMatrix& a, size_t l, Args... args) {
-        a.resize(l);
-        for (size_t i = 0; i < l; i++)
-            set<A>(a[i], args...);
+    void set(QMatrix& m, size_t n_layers, Args... args) {
+        m.resize(n_layers);
+        for (QArray& a : m)
+            set<A>(a, args...);
     }
 
     Transformer(const string& model_file);
@@ -297,9 +297,9 @@ struct Transformer {
 };
 
 Transformer::Transformer(const string& model_file) : mmap(model_file) {
-    // read a version 2 quantizied .bin file
+    // read a quantizied .bin file (version 2)
 
-    // header is used to store config parameters, before weights
+    // read header
     size_t header_size = 256;
     char* weights_ptr = mmap.next<char>(0) + header_size;
 
@@ -311,7 +311,7 @@ Transformer::Transformer(const string& model_file) : mmap(model_file) {
         exit(EXIT_FAILURE);
     }
 
-    // read in the config header
+    // read in config parameters
     dim        = *mmap.next<int32_t>();
     hidden_dim = *mmap.next<int32_t>();
     n_layers   = *mmap.next<int32_t>();
@@ -323,7 +323,7 @@ Transformer::Transformer(const string& model_file) : mmap(model_file) {
     group_size = *mmap.next<int32_t>();
 
     if (group_size != GS) {
-        cerr << "Group size: " << group_size << ", expected " << GS << endl;
+        cerr << "Group size is " << group_size << ", expected " << GS << endl;
         exit(EXIT_FAILURE);
     }
 
@@ -372,10 +372,10 @@ Transformer::Transformer(const string& model_file) : mmap(model_file) {
     set<Alloc>(freq_cis, seq_len, head_size);
     set<Alloc>(token_embedding_table, vocab_size, dim);
 
-    // we need also the expanded version
+    // compute the fp32 version of token embedding table
     dequantize(q_token_embedding_table, token_embedding_table);
 
-    // compute freq_cis
+    // compute frequency tables for RoPE
     float* ptr = freq_cis;
     for (int pos = 0; pos < seq_len; pos++) {
         for (int i = 0; i < head_size; i += 2) {
@@ -611,7 +611,7 @@ struct Tokenizer {
     Tokenizer(const string& tokenizer_path, int vocab_size);
     int str_lookup(const string& str);
     void encode(vector<int>* tokens_ptr, const string& text, bool bos, bool eos);
-    string decode(int prev_token, int token);
+    string decode(int token, int prev_token);
 
     MMap mmap;
 
@@ -632,23 +632,6 @@ Tokenizer::Tokenizer(const string& tokenizer_path, int vocab_size) : mmap(tokeni
         vocab_scores.push_back(score);
         sorted_vocab[vocab[i]] = i;
     }
-}
-
-string Tokenizer::decode(int prev_token, int token) {
-
-    // following BOS token, sentencepiece decoder strips any leading whitespace (see PR #89)
-    string token_str = vocab[token];
-    if (prev_token == BOS && token_str[0] == ' ')
-        token_str.erase(0, 1);
-
-    // careful, some tokens designate raw bytes, and look like e.g. '<0x01>'
-    unsigned char byte_val;
-    if (sscanf(token_str.c_str(), "<0x%02hhX>", &byte_val) == 1) {
-        // ok this token is a raw byte token, carefuly to only print printable chars or whitespace
-        // some of the other bytes can be various control codes, backspace, etc. => skip
-        token_str = isprint(byte_val) || isspace(byte_val) ? string(1, byte_val) : "";
-    }
-    return token_str;
 }
 
 int Tokenizer::str_lookup(const string& str) {
@@ -701,7 +684,11 @@ void Tokenizer::encode(vector<int>* tokens_ptr, const string& text, bool bos, bo
         }
     }
 
-    vector<float> sv(tokens.size(), -1e10);
+    // save scores of every consecutive pair of tokens, then proceed merging
+    // form the highest scored one, down to the lowest
+    typedef pair<float, int> PairScore;
+    PairScore None = make_pair(-1e10f, -1);
+    vector<PairScore> sv(tokens.size()); // vector of (score, token) pairs
     int start = 0;
     int end = sv.size() - 1;
 
@@ -711,31 +698,46 @@ void Tokenizer::encode(vector<int>* tokens_ptr, const string& text, bool bos, bo
         for (int i = start; i < end; i++) {
             str = vocab[tokens[i]] + vocab[tokens[i+1]];
             int id = str_lookup(str);
-            sv[i] = (id != -1 ? vocab_scores[id] : -1e10);
+            sv[i] = (id != -1 ? make_pair(vocab_scores[id], id) : None);
         }
-        // pick the best one with the highest score
-        int best_idx = argmax(sv.data(), sv.size());
 
-        if (sv[best_idx] <= -1e10)
+        // pick the best one with the highest score in [start, end)
+        auto it = max_element(sv.begin(), sv.end() - 1);
+        if (*it == None)
             break; // we couldn't find any more pairs to merge, so we're done
 
         // merge the consecutive pair (best_idx, best_idx+1) into a new token
-        str = vocab[tokens[best_idx]] + vocab[tokens[best_idx+1]];
-        tokens[best_idx] = str_lookup(str);
-
         // delete token at position best_idx+1, shift the entire sequence back 1
+        int best_idx = std::distance(sv.begin(), it);
+        tokens[best_idx] = it->second;
         tokens.erase(tokens.begin() + best_idx + 1);
-        sv.erase(sv.begin() + best_idx + 1);
-        sv[best_idx] = -1e10; // reset stale score
+        sv.erase(it+1);
 
         // update scores at previous and current position
         start = std::max(best_idx - 1, 0);
-        end = std::min(best_idx + 1, static_cast<int>(sv.size()) - 1);
+        end = std::min(best_idx + 1, static_cast<int>(tokens.size() - 1));
     }
 
     // add optional EOS token, if desired
     if (eos)
         tokens.push_back(EOS);
+}
+
+string Tokenizer::decode(int token, int prev_token) {
+
+    // following BOS token, sentencepiece decoder strips any leading whitespace (see PR #89)
+    string token_str = vocab[token];
+    if (prev_token == BOS && token_str[0] == ' ')
+        token_str.erase(0, 1);
+
+    // careful, some tokens designate raw bytes, and look like e.g. '<0x01>'
+    unsigned char byte_val;
+    if (sscanf(token_str.c_str(), "<0x%02hhX>", &byte_val) == 1) {
+        // ok this token is a raw byte token, carefuly to only print printable chars or whitespace
+        // some of the other bytes can be various control codes, backspace, etc. => skip
+        token_str = isprint(byte_val) || isspace(byte_val) ? string(1, byte_val) : "";
+    }
+    return token_str;
 }
 
 // ----------------------------------------------------------------------------
@@ -765,7 +767,7 @@ unsigned int random_u32(unsigned long long* state) {
     *state ^= *state >> 12;
     *state ^= *state << 25;
     *state ^= *state >> 27;
-    return (*state * 0x2545F4914F6CDD1Dull) >> 32;
+    return (*state * 0x2545F4914F6CDD1DULL) >> 32;
 }
 
 float random_f32(unsigned long long* state) { // random float32 in [0,1)
@@ -786,9 +788,9 @@ int Sampler::sample_topp(float* prob, float coin) {
         topp = 1.0f;
     }
 
-    // values smaller than (1 - topp) / (n - 1) cannot be part of the result
-    // so for efficiency we crop these out as candidates before sorting
-    const float cutoff = (1.0f - topp) / (vocab_size - 1);
+    // values smaller than (1 - topp) / (vocab_size - 1) cannot be part of the
+    //  result so for efficiency we crop these out as candidates before sorting
+    float cutoff = (1.0f - topp) / (vocab_size - 1);
     for (int i = 0; i < vocab_size; i++) {
         if (prob[i] >= cutoff)
             v.push_back(i);
@@ -860,10 +862,10 @@ void generate(Transformer& transformer, Tokenizer& tokenizer, Sampler& sampler,
 
     // start the main loop
     vector<int> prompt_tokens;
-    long start = 0;  // used to time our code, only initialized after first iteration
-    int token;   // will store the current/prev token in the sequence
-    int next;    // will store the next token in the sequence
-    int pos = 0; // position in the sequence
+    long start = 0; // used to time our code, only initialized after first iteration
+    int token;      // will store the current/prev token in the sequence
+    int next;       // will store the next token in the sequence
+    int pos = 0;    // position in the sequence
     int prompt_end; // position at the end of user prompt
     bool is_user_turn = true; // when in chat mode, user starts
 
@@ -923,7 +925,7 @@ void generate(Transformer& transformer, Tokenizer& tokenizer, Sampler& sampler,
         // print the token as string, decode it with the Tokenizer object
         // when in chat mode print only the Assistant response
         if ((pos >= prompt_end && next != EOS) || !is_chat) {
-            string next_str = tokenizer.decode(token, next);
+            string next_str = tokenizer.decode(next, token);
             cout << next_str << std::flush;
         }
 
@@ -1018,6 +1020,7 @@ int main(int argc, char* argv[]) {
 
     // build the Transformer via the model .bin file
     Transformer transformer(checkpoint_path);
+    print_model_info(transformer);
 
     // parameter validation/overrides
     if (rng_seed <= 0) rng_seed = (unsigned int)time(NULL);
@@ -1043,8 +1046,6 @@ int main(int argc, char* argv[]) {
 
     // build the Sampler
     Sampler sampler(transformer.vocab_size, temperature, topp, rng_seed);
-
-    print_model_info(transformer);
 
     // run!
     generate(transformer, tokenizer, sampler, prompt, system_prompt, is_chat, steps);
