@@ -575,8 +575,7 @@ float* Transformer::forward(int token, int pos) {
             // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
             val *= (1.0f / (1.0f + expf(-val)));
             // elementwise multiply with w3(x)
-            val *= hb2[i];
-            hb[i] = val;
+            hb[i] = val * hb2[i];
         }
 
         // final matmul to get the output of the ffn
