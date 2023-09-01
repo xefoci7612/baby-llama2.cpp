@@ -119,7 +119,7 @@ typedef TArray<float*> Array;
 typedef TArray<QuantizedTensor> QArray;
 
 // QMatrix is for matrix of quantized tensors, grouped per layer
-typedef vector<QArray> QMatrix;
+typedef TArray<QArray*> QMatrix;
 
 // Little helper to multiply args with a fold expressions
 template<typename... Args>
@@ -284,12 +284,13 @@ struct Transformer {
     }
 
     // in case of a QMatrix, QuantizedTensors are serialized
-    // per layer, so we allocate a vector of QArray
+    // per layer, so we allocate a QArray of QArray
     template<bool A, typename... Args>
     void set(QMatrix& m, size_t n_layers, Args... args) {
-        m.resize(n_layers);
-        for (QArray& a : m)
-            set<A>(a, args...);
+        m.base = set<Alloc, QArray>(n_layers);
+        m.set_shape<0>(n_layers);
+        for (size_t i = 0; i < n_layers; i++)
+            set<A>(*m(i), args...);
     }
 
     Transformer(const string& model_file);
@@ -390,62 +391,57 @@ Transformer::Transformer(const string& model_file) : mmap(model_file) {
 // ----------------------------------------------------------------------------
 // neural net blocks; the dynamics of the Transformer
 
-void rmsnorm(float* o, float* x, float* w, int size) {
+void* memcpy(float* o, const Array& xa) {
+    float* x = xa;
+    return ::memcpy(o, x, xa.size() * sizeof(float));
+}
+
+void rmsnorm(float* o, Array& xa, float* w) {
+    float* x = xa;
+    int n = xa.size();
+
     // calculate sum of squares
     float ss = 0.0f;
-    for (int j = 0; j < size; j++) {
+    for (int j = 0; j < n; j++)
         ss += x[j] * x[j];
-    }
-    ss /= size;
+
+    ss /= n;
     ss += 1e-5f;
     ss = 1.0f / sqrtf(ss);
     // normalize and scale
-    for (int j = 0; j < size; j++) {
+    for (int j = 0; j < n; j++)
         o[j] = w[j] * (ss * x[j]);
-    }
 }
 
-int argmax(float* prob, int n) {
+int argmax(float* x, int n) {
     // return the index with the highest value
-    return std::distance(prob, max_element(prob, prob + n));
+    return std::distance(x, max_element(x, x + n));
 }
 
-void softmax(float* x, int size, float temperature = 1.0f) {
+void softmax(float* x, int n, float temperature = 1.0f) {
     // find max value (for numerical stability)
-    int id = argmax(x, size);
+    int id = argmax(x, n);
     float max_val = x[id];
 
     // exp, sum and apply temperature
     float sum = 0.0f;
-    for (int i = 0; i < size; i++) {
+    for (int i = 0; i < n; i++) {
         x[i] = expf((x[i] - max_val) / temperature);
         sum += x[i];
     }
     // normalize
-    for (int i = 0; i < size; i++) {
+    for (int i = 0; i < n; i++)
         x[i] /= sum;
-    }
 }
 
-void matmul(float* xout, float* x, float* w, int n, int d) {
-    // W (d,n) @ x (n,) -> xout (d,)
-    // by far the most amount of time is spent inside this little function
-    int i;
-    #pragma omp parallel for private(i)
-    for (i = 0; i < d; i++) {
-        float val = 0.0f;
-        for (int j = 0; j < n; j++) {
-            val += w[i * n + j] * x[j];
-        }
-        xout[i] = val;
-    }
-}
-
-void matmul(float* xout, const QuantizedTensor& x, const QuantizedTensor& w, int n, int d) {
+void matmul(float* o, const QArray& xa, const QArray* wp) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
     // inputs to this function are both quantized
-
+    QuantizedTensor x = xa;
+    QuantizedTensor w = *wp;
+    int n = xa.size();
+    int d = wp->size() / n;
     int i;
     #pragma omp parallel for private(i)
     for (i = 0; i < d; i++) {
@@ -463,8 +459,7 @@ void matmul(float* xout, const QuantizedTensor& x, const QuantizedTensor& w, int
             val += ((float) ival) * w.s[(in + j) / GS] * x.s[j / GS];
             ival = 0;
         }
-
-        xout[i] = val;
+        o[i] = val;
     }
 }
 
@@ -492,13 +487,13 @@ float* Transformer::forward(int token, int pos) {
     for (int l = 0; l < n_layers; l++) {
 
         // attention rmsnorm (Root Mean Square Normalization)
-        rmsnorm(xb, x, rms_att_weight(l), dim);
+        rmsnorm(xb, x, rms_att_weight(l));
 
         // qkv matmuls for this position (V X M = V)
         quantize(q_x, xb);
-        matmul(query, q_x, q_wq[l], dim, dim);
-        matmul(key, q_x, q_wk[l], dim, kv_dim);
-        matmul(value, q_x, q_wv[l], dim, kv_dim);
+        matmul(query, q_x, q_wq(l));
+        matmul(key, q_x, q_wk(l));
+        matmul(value, q_x, q_wv(l));
 
         // RoPE relative positional encoding: complex-valued
         // rotate query and key by freq in each head
@@ -513,8 +508,8 @@ float* Transformer::forward(int token, int pos) {
         }
 
         // save key,value at this time step (pos) to our kv cache
-        memcpy(key_cache(l, pos), key, kv_dim * sizeof(float));
-        memcpy(value_cache(l, pos), value, kv_dim * sizeof(float));
+        memcpy(key_cache(l, pos), key);
+        memcpy(value_cache(l, pos), value);
 
         // multihead attention. iterate over all heads
         #pragma omp parallel for private(h)
@@ -558,7 +553,7 @@ float* Transformer::forward(int token, int pos) {
 
         // final matmul to get the output of the attention
         quantize(q_x, xb);
-        matmul(xb2, q_x, q_wo[l], dim, dim);
+        matmul(xb2, q_x, q_wo(l));
 
         // residual connection back into x
         for (int i = 0; i < dim; i++) {
@@ -566,13 +561,13 @@ float* Transformer::forward(int token, int pos) {
         }
 
         // ffn rmsnorm
-        rmsnorm(xb, x, rms_ffn_weight(l), dim);
+        rmsnorm(xb, x, rms_ffn_weight(l));
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
         quantize(q_x, xb);
-        matmul(hb, q_x, q_w1[l], dim, hidden_dim);
-        matmul(hb2, q_x, q_w3[l], dim, hidden_dim);
+        matmul(hb, q_x, q_w1(l));
+        matmul(hb2, q_x, q_w3(l));
 
         // SwiGLU non-linearity
         for (int i = 0; i < hidden_dim; i++) {
@@ -586,7 +581,7 @@ float* Transformer::forward(int token, int pos) {
 
         // final matmul to get the output of the ffn
         quantize(q_hb, hb);
-        matmul(xb, q_hb, q_w2[l], hidden_dim, dim);
+        matmul(xb, q_hb, q_w2(l));
 
         // residual connection
         for (int i = 0; i < dim; i++) {
@@ -595,11 +590,11 @@ float* Transformer::forward(int token, int pos) {
     }
 
     // final rmsnorm
-    rmsnorm(x, x, rms_final_weight, dim);
+    rmsnorm(x, x, rms_final_weight);
 
     // classifier into logits
     quantize(q_x, x);
-    matmul(logits, q_x, *q_wcls_ptr, dim, vocab_size);
+    matmul(logits, q_x, q_wcls_ptr);
     return logits;
 }
 
@@ -687,7 +682,7 @@ void Tokenizer::encode(vector<int>* tokens_ptr, const string& text, bool bos, bo
     // save scores of every consecutive pair of tokens, then proceed merging
     // form the highest scored one, down to the lowest
     typedef pair<float, int> PairScore;
-    PairScore None = make_pair(-1e10f, -1);
+    PairScore none = make_pair(-1e10f, -1);
     vector<PairScore> sv(tokens.size()); // vector of (score, token) pairs
     int start = 0;
     int end = sv.size() - 1;
@@ -698,12 +693,12 @@ void Tokenizer::encode(vector<int>* tokens_ptr, const string& text, bool bos, bo
         for (int i = start; i < end; i++) {
             str = vocab[tokens[i]] + vocab[tokens[i+1]];
             int id = str_lookup(str);
-            sv[i] = (id != -1 ? make_pair(vocab_scores[id], id) : None);
+            sv[i] = (id != -1 ? make_pair(vocab_scores[id], id) : none);
         }
 
-        // pick the best one with the highest score in [start, end)
+        // pick the best one with the highest score, ignore last element
         auto it = max_element(sv.begin(), sv.end() - 1);
-        if (*it == None)
+        if (*it == none)
             break; // we couldn't find any more pairs to merge, so we're done
 
         // merge the consecutive pair (best_idx, best_idx+1) into a new token
