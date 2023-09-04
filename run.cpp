@@ -418,20 +418,34 @@ int argmax(float* x, int n) {
     return std::distance(x, max_element(x, x + n));
 }
 
-void softmax(float* x, int n, float temperature = 1.0f) {
+void softmax(float* x, int n, float scale) {
     // find max value (for numerical stability)
     int id = argmax(x, n);
     float max_val = x[id];
 
-    // exp, sum and apply temperature
+    // apply scale/temperature, exp and sum
     float sum = 0.0f;
     for (int i = 0; i < n; i++) {
-        x[i] = expf((x[i] - max_val) / temperature);
+        x[i] = expf((x[i] - max_val) / scale);
         sum += x[i];
     }
     // normalize
     for (int i = 0; i < n; i++)
         x[i] /= sum;
+}
+
+void matmul(float* xout, float* x, float* w, int n, int d) {
+    // W (d,n) @ x (n,) -> xout (d,)
+    // by far the most amount of time is spent inside this little function
+    int i;
+    #pragma omp parallel for private(i)
+    for (i = 0; i < d; i++) {
+        float val = 0.0f;
+        for (int j = 0; j < n; j++) {
+            val += w[i * n + j] * x[j];
+        }
+        xout[i] = val;
+    }
 }
 
 void matmul(float* o, const QArray& xa, const QArray* wp) {
@@ -527,14 +541,13 @@ float* Transformer::forward(int token, int pos) {
                 for (int i = 0; i < head_size; i++) {
                     score += q[i] * k[i];
                 }
-                // scale down attention score before softmax
-                score /= sqrtf(head_size);
                 // save the score to the attention buffer
                 att[t] = score;
             }
 
             // softmax the scores to get attention weights, from 0..pos inclusively
-            softmax(att, pos + 1);
+            // attention scores are first scaled down by sqrtf(head_size)
+            softmax(att, pos + 1, sqrtf(head_size));
 
             // weighted sum of the values, store back into xb
             float* xb_h = xb(h);
