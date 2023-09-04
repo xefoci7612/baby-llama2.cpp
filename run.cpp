@@ -242,7 +242,6 @@ struct Transformer {
     // current wave of activations
     Array x;         // activation at current time stamp (dim,)
     Array xb;        // same, but inside a residual branch (dim,)
-    Array xb2;       // an additional buffer just for convenience (dim,)
     Array hb;        // buffer for hidden dimension in the ffn (hidden_dim,)
     Array hb2;       // buffer for hidden dimension in the ffn (hidden_dim,)
     QArray q_x;      // quantized x (dim,)
@@ -358,7 +357,6 @@ Transformer::Transformer(const string& model_file) : mmap(model_file) {
     // allocate the run-state buffers
     set<Alloc>(x, dim);
     set<Alloc>(xb, n_heads, head_size); // dim == n_heads * head_size
-    set<Alloc>(xb2, dim);
     set<Alloc>(hb, hidden_dim);
     set<Alloc>(hb2, hidden_dim);
     set<Alloc>(q_x, dim);
@@ -566,11 +564,11 @@ float* Transformer::forward(int token, int pos) {
 
         // final matmul to get the output of the attention
         quantize(q_x, xb);
-        matmul(xb2, q_x, q_wo(l));
+        matmul(xb, q_x, q_wo(l));
 
         // residual connection back into x
         for (int i = 0; i < dim; i++) {
-            x[i] += xb2[i];
+            x[i] += xb[i];
         }
 
         // ffn rmsnorm
