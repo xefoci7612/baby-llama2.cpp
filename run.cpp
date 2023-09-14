@@ -247,8 +247,6 @@ struct Transformer {
     QArray q_x;      // quantized x (dim,)
     QArray q_hb;     // quantized hb (hidden_dim,)
     Array query;     // query (n_heads, head_size)
-    Array key;       // key (kv_dim,)
-    Array value;     // value (kv_dim,)
     Array attention; // buffer for scores/attention values (n_heads, seq_len)
     Array logits;    // output logits (vocab_size)
 
@@ -333,7 +331,6 @@ Transformer::Transformer(const string& model_file) : mmap(model_file) {
 
     // memory map the Transformer weights into the data pointer
     int head_size = dim / n_heads;
-    int kv_dim = n_kv_heads * head_size;
 
     // first are the parameters that are kept in fp32
     set<Map>(rms_att_weight, n_layers, dim);
@@ -362,8 +359,6 @@ Transformer::Transformer(const string& model_file) : mmap(model_file) {
     set<Alloc>(q_x, dim);
     set<Alloc>(q_hb, hidden_dim);
     set<Alloc>(query, n_heads, head_size);
-    set<Alloc>(key, kv_dim);
-    set<Alloc>(value, kv_dim);
     set<Alloc>(attention, n_heads, seq_len);
     set<Alloc>(logits, vocab_size);
     set<Alloc>(key_cache, n_layers, seq_len, n_kv_heads, head_size);
@@ -389,9 +384,9 @@ Transformer::Transformer(const string& model_file) : mmap(model_file) {
 // ----------------------------------------------------------------------------
 // neural net blocks; the dynamics of the Transformer
 
-void* memcpy(float* o, const Array& xa) {
-    float* x = xa;
-    return ::memcpy(o, x, xa.size() * sizeof(float));
+int argmax(float* x, int n) {
+    // return the index with the highest value
+    return std::distance(x, max_element(x, x + n));
 }
 
 void rmsnorm(float* o, Array& xa, float* w) {
@@ -409,11 +404,6 @@ void rmsnorm(float* o, Array& xa, float* w) {
     // normalize and scale
     for (int j = 0; j < n; j++)
         o[j] = w[j] * (ss * x[j]);
-}
-
-int argmax(float* x, int n) {
-    // return the index with the highest value
-    return std::distance(x, max_element(x, x + n));
 }
 
 void softmax(float* x, int n, float scale) {
@@ -502,26 +492,23 @@ float* Transformer::forward(int token, int pos) {
         rmsnorm(xb, x, rms_att_weight(l));
 
         // qkv matmuls for this position (V X M = V)
+        // and save key,value at this time step (pos) to our kv cache
         quantize(q_x, xb);
         matmul(query, q_x, q_wq(l));
-        matmul(key, q_x, q_wk(l));
-        matmul(value, q_x, q_wv(l));
+        matmul(key_cache(l, pos), q_x, q_wk(l));
+        matmul(value_cache(l, pos), q_x, q_wv(l));
 
         // RoPE relative positional encoding: complex-valued
         // rotate query and key by freq in each head
         int h;
+        float* key = key_cache(l, pos);
         #pragma omp parallel for private(h)
         for (h = 0; h < dim; h += 2) {
             int k = (h % head_size);
             complexmul(query+h, query+h+1, freq[k], freq[k+1]);
-            if (h < kv_dim) {
-                complexmul(key(h), key(h+1), freq[k], freq[k+1]);
-            }
+            if (h < kv_dim)
+                complexmul(key+h, key+h+1, freq[k], freq[k+1]);
         }
-
-        // save key,value at this time step (pos) to our kv cache
-        memcpy(key_cache(l, pos), key);
-        memcpy(value_cache(l, pos), value);
 
         // multihead attention. iterate over all heads
         #pragma omp parallel for private(h)
