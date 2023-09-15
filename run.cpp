@@ -762,7 +762,8 @@ unsigned int random_u32(unsigned long long* state) {
     return (*state * 0x2545F4914F6CDD1DULL) >> 32;
 }
 
-float random_f32(unsigned long long* state) { // random float32 in [0,1)
+float random_f32(unsigned long long* state) {
+    // random float32 in [0,1)
     return (random_u32(state) >> 8) / 16777216.0f;
 }
 
@@ -773,7 +774,6 @@ int Sampler::sample_topp(float* prob, float coin) {
     // coin is a random number in [0, 1), usually from random_f32()
     vector<int> v;
     v.reserve(vocab_size);
-    float cumulative_prob = 1.0f;
 
     if (topp <= 0 || topp > 1) {
         // sample from the predicted probability distribution
@@ -781,7 +781,7 @@ int Sampler::sample_topp(float* prob, float coin) {
     }
 
     // values smaller than (1 - topp) / (vocab_size - 1) cannot be part of the
-    //  result so for efficiency we crop these out as candidates before sorting
+    // result so for efficiency we crop these out as candidates before sorting
     float cutoff = (1.0f - topp) / (vocab_size - 1);
     for (int i = 0; i < vocab_size; i++) {
         if (prob[i] >= cutoff)
@@ -793,7 +793,7 @@ int Sampler::sample_topp(float* prob, float coin) {
         sort(v.begin(), v.end(), [prob](int a, int b) { return prob[a] > prob[b]; });
 
         // truncate the list where cumulative probability exceeds topp
-        cumulative_prob = 0.0f;
+        float cumulative_prob = 0.0f;
         for (size_t i = 0; i < v.size(); i++) {
             cumulative_prob += prob[v[i]];
             if (cumulative_prob > topp) {
@@ -801,14 +801,13 @@ int Sampler::sample_topp(float* prob, float coin) {
                 break; // we've exceeded topp by including this last item
             }
         }
+        coin *= cumulative_prob; // rescale coin into [0, cumulative_prob)
     }
 
     // sample index from probabilities (they must sum to 1!)
-    float r = coin * cumulative_prob;
-    float cdf = 0.0f;
     for (size_t i = 0; i < v.size(); i++) {
-        cdf += prob[v[i]];
-        if (r < cdf)
+        coin -= prob[v[i]];
+        if (coin < 0)
             return v[i];
     }
 
@@ -818,22 +817,19 @@ int Sampler::sample_topp(float* prob, float coin) {
 int Sampler::sample(float* logits) {
 
     // sample the token given the logits and some hyperparameters
-    int next;
     if (temperature == 0.0f) {
         // greedy argmax sampling: take the token with the highest probability
-        next = argmax(logits, vocab_size);
-    } else {
-        // apply softmax with temperature to the logits to get the probabilities for next token
-        softmax(logits, vocab_size, temperature);
-
-        // flip a (float) coin (this is our source of entropy for sampling)
-        float coin = random_f32(&rng_state);
-
-        // if topp > 0 we perform top-p (nucleus) sampling, clamping the least likely
-        // tokens to zero. Othewise sample from the predicted probability distribution.
-        next = sample_topp(logits, coin);
+        return argmax(logits, vocab_size);
     }
-    return next;
+    // apply softmax with temperature to the logits to get the probabilities for next token
+    softmax(logits, vocab_size, temperature);
+
+    // flip a (float) coin (this is our source of entropy for sampling)
+    float coin = random_f32(&rng_state);
+
+    // if topp > 0 we perform top-p (nucleus) sampling, clamping the least likely
+    // tokens to zero. Othewise sample from the predicted probability distribution.
+    return sample_topp(logits, coin);
 }
 
 // ----------------------------------------------------------------------------
