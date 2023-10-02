@@ -42,6 +42,24 @@ QuantizedTensor operator+(const QuantizedTensor& qt, size_t n) {
 }
 
 // ----------------------------------------------------------------------------
+// Format user prompt according to the model's chat schema
+//
+// ./run out/tl-chatq.bin -z tok_tl-chat.bin -s 1 -p 0.7 -n 250 -t 0.9 -i "Explain huggingface" -m chat
+
+struct ChatSchema {
+    void set(string* prompt, const string& system) {
+        const string& str = format[system.empty()];
+        char* buffer = new char[str.length() + prompt->length() + system.length()];
+        sprintf(buffer, str.c_str(), system.c_str(), prompt->c_str());
+        *prompt = string(buffer);
+        delete [] buffer;
+    }
+    // use LLama 2 chat schema by default
+    string format[2] = { "[INST] <<SYS>>\n%s\n<</SYS>>\n\n%s [/INST]",
+                         "%s[INST] %s [/INST]" };
+};
+
+// ----------------------------------------------------------------------------
 // Memory mapping facility to load and read model and tokenizer files
 
 class MMap {
@@ -257,6 +275,7 @@ struct Transformer {
 
     MMap mmap;  // memory map object of the checkpoint file
     Memory mem; // memory allocation object
+    ChatSchema schema; // format user prompt according to chat model
 
     enum { Alloc = true, Map = false };
 
@@ -379,6 +398,10 @@ Transformer::Transformer(const string& model_file) : mmap(model_file) {
             *ptr++ = sinf(freq); // imaginary part
         }
     }
+
+    // use tinylama chat schema
+    schema.format[0] = "<|im_start|>system\n%s\n>user\n%s<|im_end|>\n<|im_start|>assistant\n";
+    schema.format[1] = "%s<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n";
 };
 
 // ----------------------------------------------------------------------------
@@ -870,11 +893,7 @@ void generate(Transformer& transformer, Tokenizer& tokenizer, Sampler& sampler,
                         return; // broken pipe, exit
                 }
                 // render user/system prompts into the Llama 2 Chat schema
-                if (!system_prompt.empty()) {
-                    prompt = string("[INST] <<SYS>>\n") + system_prompt + "\n<</SYS>>\n\n" + prompt + " [/INST]";
-                } else {
-                    prompt = string("[INST] ") + prompt + " [/INST]";
-                }
+                transformer.schema.set(&prompt, system_prompt);
                 cout << "Assistant: ";
             }
 
