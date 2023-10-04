@@ -46,17 +46,22 @@ QuantizedTensor operator+(const QuantizedTensor& qt, size_t n) {
 //
 // ./run out/tl-chatq.bin -z tok_tl-chat.bin -s 1 -p 0.7 -n 250 -t 0.9 -i "Explain huggingface" -m chat
 
-struct ChatSchema {
-    void set(string* prompt, const string& system) {
-        const string& str = format[system.empty()];
-        char* buffer = new char[str.length() + prompt->length() + system.length()];
-        sprintf(buffer, str.c_str(), system.c_str(), prompt->c_str());
-        *prompt = string(buffer);
-        delete [] buffer;
+class Chat {
+    // chat schemas for LLama 2 and Tinyllama
+    const string templates[2][2] = {{ "[INST] <<SYS>>\n%s\n<</SYS>>\n\n%s [/INST]",
+                                      "%s[INST] %s [/INST]" },
+                                    { "<|im_start|>system\n%s\nuser\n%s<|im_end|>\n<|im_start|>assistant\n",
+                                      "%s<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n" }};
+    bool enabled;
+    int schema;
+public:
+    Chat(bool b, int s) : enabled(b), schema(s) {}
+    operator bool() const { return enabled; }
+    string format(const string& user, const string& system) const {
+        string str = templates[schema][system.empty()];
+        return str.replace(str.find("%s"), 2, system)
+                  .replace(str.find("%s"), 2, user);
     }
-    // use LLama 2 chat schema by default
-    string format[2] = { "[INST] <<SYS>>\n%s\n<</SYS>>\n\n%s [/INST]",
-                         "%s[INST] %s [/INST]" };
 };
 
 // ----------------------------------------------------------------------------
@@ -275,7 +280,6 @@ struct Transformer {
 
     MMap mmap;  // memory map object of the checkpoint file
     Memory mem; // memory allocation object
-    ChatSchema schema; // format user prompt according to chat model
 
     enum { Alloc = true, Map = false };
 
@@ -398,10 +402,6 @@ Transformer::Transformer(const string& model_file) : mmap(model_file) {
             *ptr++ = sinf(freq); // imaginary part
         }
     }
-
-    // use tinylama chat schema
-    schema.format[0] = "<|im_start|>system\n%s\n>user\n%s<|im_end|>\n<|im_start|>assistant\n";
-    schema.format[1] = "%s<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n";
 };
 
 // ----------------------------------------------------------------------------
@@ -869,7 +869,7 @@ long time_in_ms() {
 // generation/chat loop
 
 void generate(Transformer& transformer, Tokenizer& tokenizer, Sampler& sampler,
-              string prompt, string system_prompt, bool is_chat, int steps) {
+              string prompt, string system_prompt, const Chat& chat, int steps) {
 
     // start the main loop
     vector<int> prompt_tokens;
@@ -885,7 +885,7 @@ void generate(Transformer& transformer, Tokenizer& tokenizer, Sampler& sampler,
         // when it is the user's turn to contribute tokens to the dialog...
         if (is_user_turn) {
 
-            if (is_chat) {
+            if (chat) {
                 // get the user prompt
                 if (prompt.empty()) {
                     cout << "User: ";
@@ -893,7 +893,7 @@ void generate(Transformer& transformer, Tokenizer& tokenizer, Sampler& sampler,
                         return; // broken pipe, exit
                 }
                 // render user/system prompts into the Llama 2 Chat schema
-                transformer.schema.set(&prompt, system_prompt);
+                prompt = chat.format(prompt, system_prompt);
                 cout << "Assistant: ";
             }
 
@@ -926,18 +926,18 @@ void generate(Transformer& transformer, Tokenizer& tokenizer, Sampler& sampler,
         pos++; // increment before a possible early exit due to a BOS token
 
         // data-dependent terminating condition: the BOS token delimits sequences
-        if (next == BOS && !is_chat)
+        if (next == BOS && !chat)
             break;
 
         // print the token as string, decode it with the Tokenizer object
         // when in chat mode print only the Assistant response
-        if ((pos >= prompt_end && next != EOS) || !is_chat) {
+        if ((pos >= prompt_end && next != EOS) || !chat) {
             string next_str = tokenizer.decode(next, token);
             cout << next_str << std::flush;
         }
 
         // EOS token ends the Assistant turn
-        if (next == EOS && is_chat) {
+        if (next == EOS && chat) {
             is_user_turn = true;
             cout << endl;
         }
@@ -951,7 +951,7 @@ void generate(Transformer& transformer, Tokenizer& tokenizer, Sampler& sampler,
     cout << endl;
 
     // Generate: report achieved tok/s (pos-1 because the timer starts after first iteration)
-    if (pos > 1 && !is_chat) {
+    if (pos > 1 && !chat) {
         long elapsed = time_in_ms() - start;
         cerr << "\nachieved tok/s: " << (pos-1) / (double)(elapsed)*1000 << endl;
     }
@@ -984,6 +984,7 @@ void error_usage() {
             "  -i <string> input prompt\n"
             "  -z <string> optional path to custom tokenizer\n"
             "  -m <string> mode: generate|chat, default: generate\n"
+            "  -c <string> chat schema: llama|tinyllama, default: llama\n"
             "  -y <string> (optional) system prompt in chat mode\n" << endl;
     exit(EXIT_FAILURE);
 }
@@ -999,6 +1000,7 @@ int main(int argc, char* argv[]) {
     string prompt;            // prompt string
     unsigned long long rng_seed = 0; // seed rng with time by default
     string mode = "generate"; // generate|chat
+    string schema = "llama";  // chat schema llama|tinyllama
     string system_prompt;     // the (optional) system prompt to use in chat mode
 
     // 'checkpoint' is necessary, optional arguments and their values
@@ -1019,6 +1021,7 @@ int main(int argc, char* argv[]) {
             else if (opt[i] == "-i") prompt = opt[i+1];
             else if (opt[i] == "-z") tokenizer_path = opt[i+1];
             else if (opt[i] == "-m") mode = opt[i+1];
+            else if (opt[i] == "-c") schema = opt[i+1];
             else if (opt[i] == "-y") system_prompt = opt[i+1];
             else
                 error_usage();
@@ -1040,8 +1043,8 @@ int main(int argc, char* argv[]) {
     }
 
     // try to get a system prompt
-    bool is_chat = (mode == "chat");
-    if (is_chat && system_prompt.empty()) {
+    Chat chat(mode == "chat", schema == "tinyllama");
+    if (chat && system_prompt.empty()) {
         // system prompt was not passed in, attempt to get it from stdin
         cout << "Enter system prompt (optional): ";
         if (!getline(cin, system_prompt))
@@ -1055,7 +1058,7 @@ int main(int argc, char* argv[]) {
     Sampler sampler(transformer.vocab_size, temperature, topp, rng_seed);
 
     // run!
-    generate(transformer, tokenizer, sampler, prompt, system_prompt, is_chat, steps);
+    generate(transformer, tokenizer, sampler, prompt, system_prompt, chat, steps);
 
     return 0;
 }
