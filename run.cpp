@@ -743,7 +743,7 @@ string Tokenizer::decode(int token, int prev_token) {
     // following BOS token, sentencepiece decoder strips any leading whitespace (see PR #89)
     string token_str = vocab[token];
     if (prev_token == BOS && token_str[0] == ' ')
-        token_str.erase(0, 1);
+        token_str.erase(token_str.begin());
 
     // careful, some tokens designate raw bytes, and look like e.g. '<0x01>'
     unsigned char byte_val;
@@ -869,15 +869,14 @@ long time_in_ms() {
 // generation/chat loop
 
 void generate(Transformer& transformer, Tokenizer& tokenizer, Sampler& sampler,
-              string prompt, string system_prompt, const Chat& chat, int steps) {
+              string prompt, string system_prompt, const Chat& chat, size_t steps) {
 
-    // start the main loop
     vector<int> prompt_tokens;
     long start = 0; // used to time our code, only initialized after first iteration
     int token;      // will store the current/prev token in the sequence
     int next;       // will store the next token in the sequence
-    int pos = 0;    // position in the sequence
-    int prompt_end; // position at the end of user prompt
+    size_t pos = 0; // position in the sequence
+    bool bos, eos;  // poor man's named arguments
     bool is_user_turn = true; // when in chat mode, user starts
 
     while (pos < steps) {
@@ -898,15 +897,13 @@ void generate(Transformer& transformer, Tokenizer& tokenizer, Sampler& sampler,
             }
 
             // encode the (string) prompt into tokens sequence
-            tokenizer.encode(&prompt_tokens, prompt, true, false);
+            tokenizer.encode(&prompt_tokens, prompt, bos = true, eos = false);
             if (prompt_tokens.size() < 1) {
-                cerr << "something is wrong, expected at least 1 prompt token" << endl;
+                cerr << "Something is wrong, expected at least 1 prompt token" << endl;
                 exit(EXIT_FAILURE);
             }
             token = prompt_tokens[0]; // kick off with the first token in the prompt
-            prompt_end = pos + prompt_tokens.size() - 1; // first token is already grabbed
-
-            // reset stuff
+            prompt_tokens.erase(prompt_tokens.begin()); // first token is already consumed
             is_user_turn = false;
             prompt = system_prompt = ""; // mark as consumed
         }
@@ -914,14 +911,9 @@ void generate(Transformer& transformer, Tokenizer& tokenizer, Sampler& sampler,
         // forward the transformer to get logits for the next token
         float* logits = transformer.forward(token, pos);
 
-        // advance the state machine
-        if (pos < prompt_end) {
-            // if we are still processing the input prompt, force the next prompt token
-            next = prompt_tokens[pos + 1];
-        } else {
-            // otherwise sample the next token from the logits
-            next = sampler.sample(logits);
-        }
+        // if we are still processing the input prompt, force the next prompt token
+        // otherwise sample the next token from the logits
+        next = pos < prompt_tokens.size() ? prompt_tokens[pos] : sampler.sample(logits);
 
         pos++; // increment before a possible early exit due to a BOS token
 
@@ -929,15 +921,13 @@ void generate(Transformer& transformer, Tokenizer& tokenizer, Sampler& sampler,
         if (next == BOS && !chat)
             break;
 
-        // print the token as string, decode it with the Tokenizer object
+        // decode the token into a string and print it
         // when in chat mode print only the Assistant response
-        if ((pos >= prompt_end && next != EOS) || !chat) {
-            string next_str = tokenizer.decode(next, token);
-            cout << next_str << std::flush;
-        }
+        if (!chat || (pos >= prompt_tokens.size() && next != EOS))
+            cout << tokenizer.decode(next, token) << std::flush;
 
         // EOS token ends the Assistant turn
-        if (next == EOS && chat) {
+        if (chat && next == EOS) {
             is_user_turn = true;
             cout << endl;
         }
@@ -948,12 +938,11 @@ void generate(Transformer& transformer, Tokenizer& tokenizer, Sampler& sampler,
         if (start == 0)
             start = time_in_ms();
     }
-    cout << endl;
 
     // Generate: report achieved tok/s (pos-1 because the timer starts after first iteration)
     if (pos > 1 && !chat) {
         long elapsed = time_in_ms() - start;
-        cerr << "\nachieved tok/s: " << (pos-1) / (double)(elapsed)*1000 << endl;
+        cerr << "\n\nachieved tok/s: " << (pos-1) / (double)(elapsed)*1000 << endl;
     }
 }
 
